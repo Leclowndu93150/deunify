@@ -1,0 +1,10 @@
+[package]
+name = "deunify-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Raw bindings to deunify's C ABI"
+links = "deunify"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"

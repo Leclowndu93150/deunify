@@ -1,0 +1,7 @@
+build/
+out/
+.vs/
+.vscode/
+*.user
+bindings/rust/**/target/
+Cargo.lock
