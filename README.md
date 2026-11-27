@@ -111,4 +111,5 @@ crash dump every time they crash, so keep the network off while you are making t
 
 ## License
 
-License: to be decided.
+MIT, see [LICENSE](LICENSE). Take it, change it, ship it in your emulator; keep the copyright
+notice with it.
