@@ -125,6 +125,10 @@ TEST(Census, TheLineSumsTheCardAndSaysWhatIsHeldTwice) {
 	    << line;
 	EXPECT_NE(line.find("ram 10 (3 with a tile)"), std::string::npos) << line;
 	EXPECT_NE(line.find("0 MB in RAM and a tile, 20 MB in a tile and a texture"), std::string::npos) << line;
+	snapshot.system.counted = true;
+	line                    = Census::format(snapshot);
+	EXPECT_NE(line.find("system (heap sizes, our counts): card 3000 MB of 4000 MB"), std::string::npos)
+	    << line;
 }
 
 TEST(Census, EveryContextCountsTheCardViewAndAsksTheSystem) {

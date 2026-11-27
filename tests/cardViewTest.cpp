@@ -1,11 +1,12 @@
 #include "../src/cardViewEngine.hpp"
 #include "../src/censusLedger.hpp"
+#include "cards.hpp"
 #include "deunify/cardView.hpp"
+#include "deunify/census.hpp"
 #include "deunify/context.hpp"
 #include "deunify/gpuPageTable.hpp"
 #include "deunify/loads.hpp"
 #include "deunify/physicalMemory.hpp"
-#include "cards.hpp"
 
 #include <cstring>
 #include <gtest/gtest.h>
@@ -480,6 +481,59 @@ TEST_P(Library, AWriteIntoAPageShadersWroteGoesToItsTile) {
 	ASSERT_EQ(context->loads().write(pages, 0x40, load.data(), load.size()), Status::Ok);
 	ASSERT_EQ(context->cardView()->beforeSubmit(), Status::Ok);
 	EXPECT_EQ(card->fetch(view, view.offset + 0x40, load.size()), load);
+}
+
+TEST_P(Library, ASpanIsOneRangeOfDeviceAddressesOnVulkan) {
+	deunify::SpanAddress address;
+	const Status         status = context->cardView()->spanAddress(kBase + kPageBytes, &address);
+	if (GetParam() == Api::D3d12) {
+		EXPECT_EQ(status, Status::NotSupported);
+		EXPECT_TRUE(context->cardView()->unboundReadsZero());
+		return;
+	}
+	ASSERT_EQ(status, Status::Ok);
+	EXPECT_EQ(address.gpuBase, kBase);
+	EXPECT_EQ(address.bytes, kSlots * kPageBytes);
+	EXPECT_NE(view.buffer, VK_NULL_HANDLE);
+	EXPECT_EQ(address.deviceAddress + (kBase + view.offset - address.gpuBase), view.deviceAddress);
+	EXPECT_EQ(context->cardView()->spanAddress(kBase + kSlots * kPageBytes, &address),
+	          Status::NotFound);
+	RecordProperty("unboundReadsZero", context->cardView()->unboundReadsZero() ? "yes" : "no");
+}
+
+TEST_P(Library, TheCensusCountsTheTileBlockAndAsksTheDevice) {
+	constexpr uint64_t          kTracked    = 1ull << 20;
+	constexpr uint32_t          kFirstType  = 0;
+	constexpr uint32_t          kNoSuchType = 1000;
+	const VkDeviceMemory        memory      = reinterpret_cast<VkDeviceMemory>(uintptr_t {0x1000});
+	deunify::Census&            census      = context->census();
+	const deunify::Category     ours        = census.addCategory("emulator memory");
+	deunify::CensusSnapshot     snapshot    = census.snapshot();
+	const deunify::CategoryUse& cardView    = snapshot.categories[0];
+	EXPECT_EQ(cardView.cardCount, 1u);
+	EXPECT_EQ(cardView.cardBytes, uint64_t {deunify::kHeapTiles} * kPageBytes);
+	if (GetParam() == Api::D3d12) {
+		EXPECT_FALSE(snapshot.system.known) << "no adapter given";
+		EXPECT_EQ(census.track(memory, kTracked, kFirstType, ours), Status::Unavailable);
+		return;
+	}
+	EXPECT_TRUE(snapshot.system.known);
+	EXPECT_GT(snapshot.system.localBudget, 0u);
+	if (snapshot.system.counted) {
+		EXPECT_GE(snapshot.system.localUsage, cardView.cardBytes);
+	}
+	EXPECT_EQ(census.track(memory, kTracked, kNoSuchType, ours), Status::Unavailable);
+	ASSERT_EQ(census.track(memory, kTracked, kFirstType, ours), Status::Ok);
+	ASSERT_EQ(census.track(memory, kTracked, kFirstType, ours), Status::Ok);
+	snapshot                        = census.snapshot();
+	const deunify::CategoryUse& use = snapshot.categories[static_cast<uint32_t>(ours)];
+	EXPECT_EQ(use.cardCount + use.sharedCount, 1u) << "tracking again replaces the earlier count";
+	EXPECT_EQ(use.cardBytes + use.sharedBytes, kTracked);
+	census.untrack(memory);
+	snapshot = census.snapshot();
+	EXPECT_EQ(snapshot.categories[static_cast<uint32_t>(ours)].cardCount, 0u);
+	EXPECT_EQ(snapshot.categories[static_cast<uint32_t>(ours)].sharedBytes, 0u);
+	EXPECT_FALSE(deunify::Census::format(snapshot).empty());
 }
 
 } // namespace
