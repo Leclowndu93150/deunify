@@ -171,6 +171,24 @@ TEST(CardView, EveryTwoGiBViewFitsInOneSegment) {
 	EXPECT_FALSE(deunify::cardview::segmentHolding(start, bytes, start, start + 4 * kGiB + 1));
 }
 
+TEST(CardView, ASegmentShapeTakenFromTheDeviceStillHoldsEveryAsk) {
+	const deunify::gpu::SegmentShape shape {kGiB - kPageBytes, kGiB / 2 - kPageBytes};
+	const uint64_t                   start    = 0x5'0000'0000ull;
+	const uint64_t                   bytes    = 5 * kGiB;
+	const auto                       segments = deunify::cardview::segmentsOf(bytes, shape);
+	EXPECT_EQ(segments[1].offset, shape.step);
+	EXPECT_EQ(segments.back().offset + segments.back().bytes, bytes);
+	for (uint64_t from = start; from + deunify::kLargestAskBytes <= start + bytes;
+	     from += 7 * deunify::kLargestAskBytes / 3 + kPageBytes) {
+		const uint64_t              to = from + deunify::kLargestAskBytes;
+		const std::optional<size_t> k =
+		    deunify::cardview::segmentHolding(start, bytes, from, to, shape);
+		ASSERT_TRUE(k.has_value());
+		EXPECT_LE(to, start + segments[*k].offset + segments[*k].bytes);
+		EXPECT_EQ(deunify::cardview::placeOf(start, from, shape).segment, *k);
+	}
+}
+
 TEST(CardView, ASlotIsPlacedInItsSpansSegment) {
 	using deunify::cardview::placeOf;
 	const uint64_t view = 0x5'0000'0000ull;

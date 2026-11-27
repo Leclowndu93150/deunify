@@ -18,7 +18,7 @@ what we did with those).
 
 | Emulator function | deunify call | Notes |
 |---|---|---|
-| Start of the title process | `Context::create(config, callbacks)` | `config.device`/`queue`: the D3D12 device and the queue title work is submitted to, or both null for no card view |
+| Start of the title process | `Context::create(config, callbacks)` | `config.device`/`queue`: the D3D12 device and the queue title work is submitted to; or `config.vulkan` (see "On Vulkan"); or neither, for no card view |
 | Reserve of the title address space | (emulator) placeholders with `VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` | deunify maps views into placeholders; it does not reserve address space |
 | Allocate physical pages | `PhysicalMemory::allocate` | numbers returned are the title's page numbers |
 | Free physical pages | `PhysicalMemory::free` | |
@@ -36,15 +36,71 @@ what we did with those).
 | Kernel file reads into title memory (`ReadFile`, sockets) | `KernelWrite` around the call | `Access::Read` for kernel reads from title memory (`WriteFile`) |
 | Renderer: a buffer view (SRV, UAV, CBV, raw address) of title memory | `CardView::bufferFor` | fall back to the emulator's own path on `TooLarge` or `NotFound` |
 | Renderer: a view shaders may write | `CardView::shaderWrites` | every UAV and copy destination over title memory |
-| Queue: before `ExecuteCommandLists` | `CardView::beforeSubmit` | without a card view: `Pages::takeWritten` for your uploads and `Context::deliverChanges` |
+| Queue: before `ExecuteCommandLists` or `vkQueueSubmit` of title work | `CardView::beforeSubmit` | without a card view: `Pages::takeWritten` for your uploads and `Context::deliverChanges` |
 | Texture cache: read bytes to make a texture | `GpuPageTable::read(..., ReadPurpose::TextureUpload)` | never read title memory at its address for this |
 | Texture cache: invalidation | `Callbacks::pagesChanged` | |
 | Emulator reads of title memory for its own use | `Pages::readTitle` or `GpuPageTable::read` | reading at the title address works too, but brings the page to RAM |
-| Memory statistics | `Census::snapshot`, `Census::format` | track your own heaps with `Census::track` to see the whole card |
+| Memory statistics | `Census::snapshot`, `Census::format` | track your own heaps (or `VkDeviceMemory`) with `Census::track` to see the whole card |
 | Title code patches | `patch::Sites`, `patch::redirectCall` | sites files stay in the emulator project |
 
 C users get the same through `include/deunify.h`, and Rust users raw declarations of it in
 `bindings/rust/deunify-sys`.
+
+## On Vulkan
+
+Many emulators translate the console's shaders to SPIR-V and render with Vulkan. The card view
+works there too. Everything in this file holds, with these additions.
+
+**What to pass.** `Config::vulkan`, and leave `device` and `queue` null. The instance, the
+physical device, the device and `vkGetInstanceProcAddr`; deunify loads every other function
+itself and never links `vulkan-1.lib`. Then two queues:
+
+- `transferQueue` is the queue your title work over card-view memory runs on. Fills and
+  read-backs go there, and that is what orders them against the title's work, as
+  `Config::queue` does on D3D12. Its family needs graphics, compute or transfer. Passing some
+  other queue loses that order.
+- `sparseQueue` is any queue whose family has `VK_QUEUE_SPARSE_BINDING_BIT`. It may be the same
+  queue. On most desktop cards the graphics family has the bit.
+
+A `VkQueue` takes one thread at a time, and a read-back submits from whichever thread touched
+the page. If anything else submits to these queues, set `Callbacks::queueLock` and take your
+own lock in it.
+
+**Features and extensions.** Vulkan 1.2 or later, with `sparseBinding`,
+`sparseResidencyBuffer` and `bufferDeviceAddress` enabled when you create the device.
+`Context::create` says `NotSupported` if the physical device lacks them, and we can't tell
+whether you enabled them, so do. Enable `timelineSemaphore` too and set
+`VulkanSetup::timelineSemaphores`. Without it every batch of bindings is waited for on the
+CPU, which works and costs a stall per submission that moves tiles. `VK_EXT_memory_budget`
+only has to be supported by the device for the census to read the system's budget; without
+it the census shows heap sizes and its own counts, and says so. Track your own allocations
+with `Census::track(VkDeviceMemory, ...)` and untrack them before you free them.
+
+**Views.** `bufferFor` gives a `VkBuffer`, an offset in it and the device address of that
+offset. A descriptor takes the buffer, the offset and `bytes`. A view never crosses the end of
+its buffer, and the buffers fit `maxStorageBufferRange`. The offset is wherever the title's view
+starts, so mind `minStorageBufferOffsetAlignment`: round down and add the rest in the shader,
+as you would without deunify.
+
+**Console pointers.** Translated RDNA2 code reaches memory through 64-bit addresses (the base
+of a buffer resource, scalar loads from raw addresses), and the usual way to keep that on
+Vulkan is a device address plus an offset. `CardView::spanAddress` gives each span as one flat
+range: GPU address `gpuBase + n` is device address `deviceAddress + n`. Hand the shader
+`deviceAddress - gpuBase` once per span (a push constant does it) and add it to the console
+pointer; the wrap-around of 64-bit addition takes care of the sign. Only pages that got tiles
+are backed, so ask `bufferFor` for what a draw or a dispatch reads before you submit it, as you
+would for a descriptor. The flat range is one more sparse buffer, bound like the segments, so
+it costs address space and bindings. A span that fits in one segment uses that segment for it.
+
+**Without `residencyNonResidentStrict`.** Then a read of a slot that holds no tile is
+undefined: zeros, stale bytes of another tile, or anything else. `CardView::unboundReadsZero`
+tells you which kind of device you have. The driver we tested on has the property; check
+yours. deunify binds nothing in place of a missing tile. A slot has no tile when nobody asked
+for it or when the title's page table maps nothing there. The first is yours to avoid: ask for
+every range a shader can read. For the second, if the title reads unmapped memory and counts
+on zeros, give it a page of zeros: allocate one physical page, never write it, and map it into
+those slots with `GpuPageTable::map` (in a GPU-only range). Every slot showing it shares one
+tile. Never do that where shaders may write.
 
 ## Rules that don't bend
 
@@ -57,7 +113,8 @@ C users get the same through `include/deunify.h`, and Rust users raw declaration
 - Respect the lock order in `context.hpp`. Never call deunify from `Callbacks::log`. Never call
   `Pages::handleFault` while holding a lock that a deunify call on another thread might wait for.
 - `CardView::beforeSubmit` runs on the submitting thread right before the title's lists go to
-  `Config::queue`. Work on other queues that touches card-view memory waits for that queue.
+  `Config::queue` (on Vulkan, the transfer queue). Work on other queues that touches card-view
+  memory waits for that queue.
 - The library never touches title addresses itself. Keep it that way when you adapt it.
 
 ## Bring-up order

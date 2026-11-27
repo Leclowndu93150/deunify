@@ -2,6 +2,7 @@
 
 #include "testFiles.hpp"
 
+#include "deunify/cardView.hpp"
 #include "deunify/context.hpp"
 #include "deunify/types.hpp"
 
@@ -27,6 +28,9 @@ TEST(CApi, ValuesMatchTheCppHeaders) {
 	static_assert(DEUNIFY_KIND_GPU_ONLY == static_cast<int32_t>(deunify::Kind::GpuOnly));
 	static_assert(DEUNIFY_FIRST_CUSTOM_CODEC == deunify::kFirstCustomCodec);
 	static_assert(sizeof(DeunifyRange) == sizeof(deunify::Range));
+	static_assert(sizeof(DeunifyBufferView) == 5 * sizeof(uint64_t));
+	static_assert(sizeof(DeunifyVulkanSetup) == 6 * sizeof(void*) + 4 * sizeof(uint32_t));
+	static_assert(sizeof(DeunifySpanAddress) == sizeof(deunify::SpanAddress));
 	SUCCEED();
 }
 

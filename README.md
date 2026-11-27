@@ -1,7 +1,7 @@
 # deunify
 
 Memory infrastructure for Xbox Series emulators on PCs with a discrete GPU. C++20, Windows x64,
-D3D12.
+D3D12 or Vulkan.
 
 The console's GPU reads everything from one fast memory. On a PC, whatever the GPU reads from
 RAM crosses the PCIe bus, which is roughly ten times slower than the card's own memory, and
@@ -50,12 +50,14 @@ ABI over the same, and `bindings/rust/deunify-sys` declares that ABI for Rust. I
 - `Pages`: homes, faults, lazy commit, write tracking, kernel brackets.
 - `Loads`: load records, staging, decode-once, replay, zlib.
 - `GpuPageTable`: the title's GPU view, including the queue's page-mapping copies.
-- `CardView`: title memory on the card as tiles of reserved buffers.
+- `CardView`: title memory on the card as tiles of reserved buffers (D3D12) or sparse buffers
+  (Vulkan).
 - `Census`: video memory by category, against what the system reports.
 - `patch`: helpers for patching title code at load.
 
-`tests/` has a GoogleTest suite per component; the card view tests run on WARP when it offers
-tiled resources tier 2.
+`tests/` has a GoogleTest suite per component. The card view tests run on WARP when it offers
+tiled resources tier 2, and on the first Vulkan device with sparse residency for buffers, once
+with timeline semaphores and once without. They skip, and say why, where neither is there.
 
 It does not do rendering, texture caching, shader translation or file systems, it ships no
 console codec except zlib (yours go through a callback), and it leaves the title's committed
@@ -78,7 +80,9 @@ build\deunify_tests.exe
 ```
 
 Everything lands in `build/`: `deunify_static.lib` (C++ and C API) and `deunify.dll` with its
-import library (C ABI only). zlib and GoogleTest are fetched at configure time.
+import library (C ABI only). zlib, GoogleTest and Vulkan-Headers are fetched at configure time.
+Nothing links the Vulkan loader: deunify loads what it needs through the `vkGetInstanceProcAddr`
+you give it, and the tests find `vulkan-1.dll` at run time.
 
 ## Where it stands
 
@@ -87,6 +91,9 @@ This is a C++ port of that code with the emulator taken out. It has its own test
 run a title yet. Treat it as a reference implementation: read it, adapt it to your engine, fix
 what you find, and keep the invariants in ARCHITECTURE.md, because each of them is there for a
 reason we found the hard way.
+
+The Vulkan backend is newer still. It has run in the tests here, on one desktop card, and
+nowhere else.
 
 Known rough edges, found while putting the components together and still open:
 

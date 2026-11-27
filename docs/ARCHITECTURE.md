@@ -32,8 +32,9 @@ stories.
 4. Host kernel calls that touch title memory are bracketed (`KernelWrite`): the kernel fails
    where a thread would fault.
 5. Nothing reaches the card except in `CardView::beforeSubmit`, on the submitting thread,
-   ahead of the title's lists on the same queue; except read-backs, which any thread puts on
-   the queue under the queue order lock (7) and then waits for with no lock held.
+   ahead of the title's lists on the same queue (on Vulkan, ordered ahead of them with
+   semaphores); except read-backs, which any thread puts on the queue under the queue order
+   lock (7) and then waits for with no lock held.
 6. A page number names one page for as long as anything can reach that page (numbers are reused
    only after the page is freed and its last view is gone).
 
@@ -46,7 +47,7 @@ stories.
 | `GpuPageTable` | `gpuPageTable.hpp` | GPU slot -> page (unified ranges follow CPU views; GPU-only ranges take explicit mappings) |
 | `Pages` | `pages.hpp` | per-page home and flags, kinds of address ranges, the fault entry, write tracking, kernel brackets, parking |
 | `Loads` | `loads.hpp` | files, per-page load records, staging, decoded-request cache, decode workers, zlib |
-| `CardView` | `cardView.hpp` | spans, reserved buffers (segments), tile heaps, slot -> tile, batched mapping changes, fills, read-backs |
+| `CardView` | `cardView.hpp` | spans, reserved or sparse buffers (segments), tile blocks, slot -> tile, batched mapping changes, fills, read-backs |
 | `Census` | `census.hpp` | allocations by category, system numbers, twice-held bytes |
 | `patch` | `patch.hpp` | sites files, code writes, stubs near the image, verified call redirection |
 | C ABI | `deunify.h` | the same over an opaque context |
@@ -131,10 +132,47 @@ orphan's bytes coming back) does nothing for a page that is no longer Card home.
 
 **Submission.** `beforeSubmit` on the submitting thread, in this order: retired heaps the queue
 finished with released; orphaned Card pages (their last slot went) read back to RAM; tile
-mapping changes (one `UpdateTileMappings` per heap and buffer); home changes for shader writes
+mapping changes (one `UpdateTileMappings` per heap and buffer, or one `vkQueueBindSparse` for
+all of them); home changes for shader writes
 and Card spans (the pages' bytes are taken from their old homes and held for their tiles);
 fills of new tiles, loaded bytes, CPU-written pages and the held bytes, in one list; change
 notifications delivered.
+
+## Backends
+
+The card view and the census reach the graphics API through one internal interface,
+`gpu::Backend` in `src/gpuBackend.hpp`. `d3d12Backend` and `vulkanBackend` implement it.
+Everything above it is the same on both: slots, tiles, homes, the order of work in
+`beforeSubmit`, the locks.
+
+| D3D12 | Vulkan |
+|---|---|
+| reserved buffer | sparse buffer (sparse binding and residency, storage and device address usage) |
+| segments of 4 GiB every 2 GiB | segments as long as `maxStorageBufferRange` allows (4 GiB at most), every half segment, and one more buffer over the whole span for a flat device address |
+| tile heap of 64 MiB | `VkDeviceMemory` block of 64 MiB from a device-local type |
+| `UpdateTileMappings`, one per heap and buffer | one `VkSparseBufferMemoryBindInfo` per block and buffer, all in one `vkQueueBindSparse` |
+| a NULL tile range | a `VkSparseMemoryBind` without memory |
+| copies on `Config::queue` | copies on the transfer queue, from and to host-visible staging buffers |
+| queue order and a fence | a timeline semaphore that every submission waits on and signals, or a fence per submission without one |
+| DXGI `QueryVideoMemoryInfo` | `VK_EXT_memory_budget`, or the heap sizes and our own counts |
+| counted objects uncount themselves (`SetPrivateDataInterface`) | `Census::track` and `untrack` of `VkDeviceMemory` |
+
+What differs underneath:
+
+- Order. D3D12 does everything on one queue and gets its order for free. On Vulkan, bindings go
+  to the sparse queue and are not ordered against command buffers, not even on the same queue.
+  So each batch of bindings waits for a signal from the transfer queue (it then comes after the
+  title's work that used the old bindings), copies wait for the bindings, and `beforeSubmit`
+  ends with a wait on the transfer queue, so the title's next submission comes after all of it.
+  Every copy starts and ends with a global memory barrier. Without timeline semaphores the
+  bindings are waited for on the CPU instead.
+- Slots are 64 KiB on both. The Vulkan sparse block size comes from the buffer's memory
+  requirements. It has to divide 64 KiB; a device where it doesn't is refused.
+- Unbound reads return zeros on D3D12 (tier 2). On Vulkan they do only with
+  `residencyNonResidentStrict`. deunify binds nothing in their place either way and reports
+  which it is (`CardView::unboundReadsZero`). INTEGRATING.md says what to do when it's false.
+- Every Vulkan buffer we make counts against `sparseAddressSpaceSize`, and a buffer that would
+  go past it fails with `OutOfMemory`. We only count our own buffers.
 
 ## Threads and locks
 
@@ -146,7 +184,7 @@ notifications delivered.
 | 4 GpuPageTable | slots, ranges | short (alias views without a card view: calls PhysicalMemory, taking 1-3) |
 | 5 Pages | homes, flags, kinds, write list, kernel brackets | state and protection changes only; never a read-back, a replay or a decode (those run unlocked, and their bytes land only if the page's version did not change meanwhile, else the transfer is retried) |
 | 6 Loads records -> staging -> decoded | per-page records, staged bytes, decoded requests | short; decoding runs unlocked (a once-cell per request) |
-| 7 CardView queue order -> state | ordering of queue work, slots, tiles, heaps, pending work | queue order: across `UpdateTileMappings`, fills and the read-back copy's submission, never while waiting for the queue; state: short |
+| 7 CardView queue order -> state | ordering of queue work, slots, tiles, heaps, pending work | queue order: across mapping changes, fills and the read-back copy's submission, never while waiting for the queue; state: short |
 | 8 Census | categories and counters | short |
 
 A thread takes locks only in increasing number, with one exception: 2 and 3 are leaves. They are
