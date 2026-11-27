@@ -1,7 +1,7 @@
 #include "deunify/deunify.hpp"
 
+#include "testCard.hpp"
 #include "testFiles.hpp"
-#include "warp.hpp"
 
 #include <windows.h>
 
@@ -48,17 +48,15 @@ std::vector<uint8_t> slice(const std::vector<uint8_t>& bytes, uint64_t from, uin
 	return std::vector<uint8_t>(bytes.begin() + from, bytes.begin() + from + count);
 }
 
-class EndToEnd: public ::testing::Test {
+class EndToEnd: public ::testing::TestWithParam<deunify::test::Api> {
 protected:
 	void SetUp() override {
-		if (!warp.tiled()) {
-			GTEST_SKIP() << "WARP without tiled resources tier 2";
+		card = deunify::test::makeTestCard(GetParam());
+		if (const std::string missing = card->missing(); !missing.empty()) {
+			GTEST_SKIP() << missing;
 		}
-		deunify::Config config;
-		config.device = warp.device.Get();
-		config.queue  = warp.queue.Get();
 		Status status = Status::HostFailure;
-		context       = deunify::Context::create(config, deunify::Callbacks {}, &status);
+		context       = deunify::Context::create(card->config(), deunify::Callbacks {}, &status);
 		ASSERT_EQ(status, Status::Ok);
 		g_pages   = &context->pages();
 		m_handler = AddVectoredExceptionHandler(1, sendFaultToPages);
@@ -79,15 +77,18 @@ protected:
 		}
 	}
 
-	deunify::test::Warp               warp;
-	std::unique_ptr<deunify::Context> context;
+	std::unique_ptr<deunify::test::TestCard> card;
+	std::unique_ptr<deunify::Context>        context;
 	uint64_t                          cpuBase = 0;
 
 private:
 	void* m_handler = nullptr;
 };
 
-TEST_F(EndToEnd, ALoadedFileGoesThroughStagingTilesRamAndTheCard) {
+INSTANTIATE_TEST_SUITE_P(Backends, EndToEnd, ::testing::ValuesIn(deunify::test::kApis),
+                         deunify::test::apiName);
+
+TEST_P(EndToEnd, ALoadedFileGoesThroughStagingTilesRamAndTheCard) {
 	PageNumber pages[kPages] = {};
 	ASSERT_EQ(context->physical().allocate(kPages, 0, pages), Status::Ok);
 	ASSERT_EQ(context->physical().map(cpuBase, pages), Status::Ok);
@@ -121,7 +122,7 @@ TEST_F(EndToEnd, ALoadedFileGoesThroughStagingTilesRamAndTheCard) {
 	ASSERT_EQ(context->cardView()->beforeSubmit(), Status::Ok);
 	EXPECT_EQ(context->loads().totals().stagedReads, kPages);
 	EXPECT_EQ(context->loads().totals().stagedBytes, 0u);
-	EXPECT_EQ(warp.fetch(view.resource, view.offset, kPages * kPageBytes), plain);
+	EXPECT_EQ(card->fetch(view, view.offset, kPages * kPageBytes), plain);
 	EXPECT_EQ(context->pages().state(pages[0]).home, Home::File);
 	EXPECT_TRUE(context->pages().state(pages[0]).tile);
 
@@ -135,8 +136,7 @@ TEST_F(EndToEnd, ALoadedFileGoesThroughStagingTilesRamAndTheCard) {
 	ASSERT_EQ(context->cardView()->beforeSubmit(), Status::Ok);
 	EXPECT_EQ(context->pages().state(pages[0]).home, Home::Card);
 	EXPECT_EQ(context->cardView()->totals().cardHomePages, 1u);
-	warp.store(view.resource, view.offset + kShaderOffset,
-	           std::vector<uint8_t>(kShaderBytes, kShaderValue));
+	card->store(view, view.offset + kShaderOffset, std::vector<uint8_t>(kShaderBytes, kShaderValue));
 	std::vector<uint8_t> expected = slice(plain, 0, kPageBytes);
 	std::fill_n(expected.begin() + kShaderOffset, kShaderBytes, kShaderValue);
 	EXPECT_EQ(readTitle(cpuBase, kPageBytes), expected);

@@ -1,14 +1,14 @@
 #include "deunify/census.hpp"
 
 #include "censusLedger.hpp"
+#include "d3d12Backend.hpp"
+#include "gpuBackend.hpp"
 
 #include "deunify/context.hpp"
 #include "deunify/gpuPageTable.hpp"
 
-#include <d3d12.h>
-#include <dxgi1_4.h>
-
 #include <algorithm>
+#include <mutex>
 
 namespace deunify {
 
@@ -16,28 +16,9 @@ namespace {
 
 constexpr const char* kCardViewName = "card view";
 constexpr uint32_t    kMegabyteShift = 20;
-constexpr UINT        kFirstNode     = 0;
 
 std::string megabytes(uint64_t bytes) {
 	return std::to_string(bytes >> kMegabyteShift) + " MB";
-}
-
-bool queryGroup(IDXGIAdapter3* adapter, DXGI_MEMORY_SEGMENT_GROUP group, uint64_t& usage, uint64_t& budget) {
-	DXGI_QUERY_VIDEO_MEMORY_INFO info {};
-	if (FAILED(adapter->QueryVideoMemoryInfo(kFirstNode, group, &info))) {
-		return false;
-	}
-	usage  = info.CurrentUsage;
-	budget = info.Budget;
-	return true;
-}
-
-SystemMemory systemMemoryOf(IDXGIAdapter3* adapter) {
-	SystemMemory system;
-	system.known = queryGroup(adapter, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, system.localUsage, system.localBudget) &&
-	               queryGroup(adapter, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, system.nonLocalUsage,
-	                          system.nonLocalBudget);
-	return system;
 }
 
 std::string categoriesText(const std::vector<CategoryUse>& categories, bool card) {
@@ -102,26 +83,29 @@ struct Census::Impl {
 		}));
 	}
 
-	IDXGIAdapter3* takeAdapter() {
-		std::lock_guard lock(adapterMutex);
-		if (adapter != nullptr) {
-			adapter->AddRef();
+	SystemMemory systemMemory() {
+		std::shared_ptr<gpu::MemoryReport> report;
+		{
+			std::lock_guard lock(reportMutex);
+			report = adapterReport;
 		}
-		return adapter;
+		if (report) {
+			return report->systemMemory(ledger->uses());
+		}
+		return backend != nullptr ? backend->systemMemory(ledger->uses()) : SystemMemory {};
 	}
 
-	std::shared_ptr<detail::Ledger> ledger = std::make_shared<detail::Ledger>();
-	std::mutex                      adapterMutex;
-	IDXGIAdapter3*                  adapter = nullptr;
+	std::shared_ptr<detail::Ledger>    ledger = std::make_shared<detail::Ledger>();
+	std::mutex                         reportMutex;
+	std::shared_ptr<gpu::MemoryReport> adapterReport;
+	gpu::Backend*                      backend = nullptr;
 };
 
 Census::Census(Context& context) : m_context(context), m_impl(std::make_unique<Impl>()) {
 	m_impl->ledger->addCategory(kCardViewName);
 }
 
-Census::~Census() {
-	setAdapter(nullptr);
-}
+Census::~Census() = default;
 
 Category Census::addCategory(const char* name) {
 	return m_impl->ledger->addCategory(name);
@@ -138,10 +122,7 @@ Status Census::track(ID3D12Device* device, ID3D12Resource* resource, Category ca
 CensusSnapshot Census::snapshot() {
 	CensusSnapshot snapshot;
 	snapshot.categories = m_impl->ledger->uses();
-	if (IDXGIAdapter3* adapter = m_impl->takeAdapter()) {
-		snapshot.system = systemMemoryOf(adapter);
-		adapter->Release();
-	}
+	snapshot.system     = m_impl->systemMemory();
 	snapshot.homes           = m_context.pages().counts();
 	snapshot.physical        = m_context.physical().totals();
 	snapshot.loads           = m_context.loads().totals();
@@ -155,18 +136,17 @@ CensusSnapshot Census::snapshot() {
 }
 
 void Census::setAdapter(IDXGIAdapter3* adapter) {
-	if (adapter != nullptr) {
-		adapter->AddRef();
-	}
-	IDXGIAdapter3* old = nullptr;
-	{
-		std::lock_guard lock(m_impl->adapterMutex);
-		old              = m_impl->adapter;
-		m_impl->adapter  = adapter;
-	}
-	if (old != nullptr) {
-		old->Release();
-	}
+	std::shared_ptr<gpu::MemoryReport> report = adapter != nullptr ? gpu::dxgiReport(adapter) : nullptr;
+	std::lock_guard                    lock(m_impl->reportMutex);
+	m_impl->adapterReport.swap(report);
+}
+
+std::shared_ptr<detail::Ledger> Census::ledger() const {
+	return m_impl->ledger;
+}
+
+void Census::attach(gpu::Backend* backend) {
+	m_impl->backend = backend;
 }
 
 std::string Census::format(const CensusSnapshot& snapshot) {

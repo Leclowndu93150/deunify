@@ -34,6 +34,8 @@ set(DEUNIFY_SOURCES
 	src/censusLedger.cpp
 	src/codecs.cpp
 	src/context.cpp
+	src/d3d12Backend.cpp
+	src/gpuBackend.cpp
 	src/gpuPageTable.cpp
 	src/hostError.cpp
 	src/loadBook.cpp

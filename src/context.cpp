@@ -110,10 +110,10 @@ Context::Context(const Config& config, const Callbacks& callbacks)
 	m_impl->loads.reset(new Loads(*this));
 	m_impl->pages.reset(new Pages(*this));
 	m_impl->gpuPages.reset(new GpuPageTable(*this));
+	m_impl->census.reset(new Census(*this));
 	if (config.device != nullptr) {
 		m_impl->cardView.reset(new CardView(*this));
 	}
-	m_impl->census.reset(new Census(*this));
 }
 
 Context::~Context() {

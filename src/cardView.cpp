@@ -26,11 +26,6 @@ namespace {
 constexpr uint64_t kTileBytes        = kPageBytes;
 constexpr uint64_t kBitsPerWord      = 64;
 constexpr uint64_t kUploadLeastBytes = 4ull << 20;
-constexpr uint64_t kDeviceRemoved    = ~0ull;
-constexpr wchar_t  kSegmentName[]    = L"deunify card view segment";
-constexpr wchar_t  kHeapName[]       = L"deunify card view tiles";
-constexpr wchar_t  kUploadName[]     = L"deunify card view upload";
-constexpr wchar_t  kReadbackName[]   = L"deunify card view read-back";
 
 uint64_t slotOf(uint64_t address) {
 	return address / kTileBytes;
@@ -40,147 +35,9 @@ uint64_t addressOf(uint64_t slot) {
 	return slot * kTileBytes;
 }
 
-Status statusOf(HRESULT result) {
-	return result == E_OUTOFMEMORY ? Status::OutOfMemory : Status::HostFailure;
-}
-
-D3D12_RESOURCE_DESC bufferDesc(uint64_t bytes, D3D12_RESOURCE_FLAGS flags) {
-	D3D12_RESOURCE_DESC desc {};
-	desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-	desc.Width            = bytes;
-	desc.Height           = 1;
-	desc.DepthOrArraySize = 1;
-	desc.MipLevels        = 1;
-	desc.SampleDesc.Count = 1;
-	desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-	desc.Flags            = flags;
-	return desc;
-}
-
-struct HostBuffer {
-	ComPtr<ID3D12Resource> resource;
-	uint8_t*               data  = nullptr;
-	uint64_t               bytes = 0;
-};
-
-HRESULT makeHostBuffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t bytes,
-                       HostBuffer* buffer) {
-	D3D12_HEAP_PROPERTIES properties {};
-	properties.Type                   = type;
-	const D3D12_RESOURCE_DESC   desc  = bufferDesc(bytes, D3D12_RESOURCE_FLAG_NONE);
-	const D3D12_RESOURCE_STATES state = type == D3D12_HEAP_TYPE_UPLOAD
-	                                        ? D3D12_RESOURCE_STATE_GENERIC_READ
-	                                        : D3D12_RESOURCE_STATE_COPY_DEST;
-	ComPtr<ID3D12Resource>      resource;
-	HRESULT result = device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
-	                                                 state, nullptr, IID_PPV_ARGS(&resource));
-	if (FAILED(result)) {
-		return result;
-	}
-	void* data = nullptr;
-	result     = resource->Map(0, nullptr, &data);
-	if (FAILED(result)) {
-		return result;
-	}
-	resource->SetName(type == D3D12_HEAP_TYPE_UPLOAD ? kUploadName : kReadbackName);
-	*buffer = {std::move(resource), static_cast<uint8_t*>(data), bytes};
-	return S_OK;
-}
-
-struct CommandSet {
-	ComPtr<ID3D12CommandAllocator>    allocator;
-	ComPtr<ID3D12GraphicsCommandList> list;
-};
-
-HRESULT makeCommandSet(ID3D12Device* device, CommandSet* commands) {
-	HRESULT result = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-	                                                IID_PPV_ARGS(&commands->allocator));
-	if (FAILED(result)) {
-		return result;
-	}
-	result = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commands->allocator.Get(),
-	                                   nullptr, IID_PPV_ARGS(&commands->list));
-	if (FAILED(result)) {
-		return result;
-	}
-	return commands->list->Close();
-}
-
-HRESULT beginCommands(const CommandSet& commands) {
-	HRESULT result = commands.allocator->Reset();
-	if (FAILED(result)) {
-		return result;
-	}
-	return commands.list->Reset(commands.allocator.Get(), nullptr);
-}
-
-void execute(ID3D12CommandQueue* queue, const CommandSet& commands) {
-	ID3D12CommandList* lists[] = {commands.list.Get()};
-	queue->ExecuteCommandLists(1, lists);
-}
-
-class Mapping {
-public:
-	void add(uint64_t slot, std::optional<uint32_t> tile) {
-		const D3D12_TILE_RANGE_FLAGS flag =
-		    tile ? D3D12_TILE_RANGE_FLAG_NONE : D3D12_TILE_RANGE_FLAG_NULL;
-		const UINT start = tile.value_or(0);
-		if (extends(slot, flag, start)) {
-			++m_sizes.back().NumTiles;
-			++m_counts.back();
-			return;
-		}
-		D3D12_TILED_RESOURCE_COORDINATE coordinate {};
-		coordinate.X = static_cast<UINT>(slot);
-		D3D12_TILE_REGION_SIZE size {};
-		size.NumTiles = 1;
-		m_coordinates.push_back(coordinate);
-		m_sizes.push_back(size);
-		m_flags.push_back(flag);
-		m_starts.push_back(start);
-		m_counts.push_back(1);
-	}
-
-	void append(const Mapping& other) {
-		m_coordinates.insert(m_coordinates.end(), other.m_coordinates.begin(),
-		                     other.m_coordinates.end());
-		m_sizes.insert(m_sizes.end(), other.m_sizes.begin(), other.m_sizes.end());
-		m_flags.insert(m_flags.end(), other.m_flags.begin(), other.m_flags.end());
-		m_starts.insert(m_starts.end(), other.m_starts.begin(), other.m_starts.end());
-		m_counts.insert(m_counts.end(), other.m_counts.begin(), other.m_counts.end());
-	}
-
-	bool empty() const { return m_coordinates.empty(); }
-
-	uint32_t send(ID3D12CommandQueue* queue, ID3D12Resource* buffer, ID3D12Heap* heap) const {
-		if (empty()) {
-			return 0;
-		}
-		const UINT ranges = static_cast<UINT>(m_coordinates.size());
-		queue->UpdateTileMappings(buffer, ranges, m_coordinates.data(), m_sizes.data(), heap,
-		                          ranges, m_flags.data(), m_starts.data(), m_counts.data(),
-		                          D3D12_TILE_MAPPING_FLAG_NONE);
-		return 1;
-	}
-
-private:
-	bool extends(uint64_t slot, D3D12_TILE_RANGE_FLAGS flag, UINT start) const {
-		if (empty() || m_flags.back() != flag) {
-			return false;
-		}
-		const UINT tiles = m_sizes.back().NumTiles;
-		if (m_coordinates.back().X + uint64_t {tiles} != slot) {
-			return false;
-		}
-		return flag == D3D12_TILE_RANGE_FLAG_NULL || m_starts.back() + tiles == start;
-	}
-
-	std::vector<D3D12_TILED_RESOURCE_COORDINATE> m_coordinates;
-	std::vector<D3D12_TILE_REGION_SIZE>          m_sizes;
-	std::vector<D3D12_TILE_RANGE_FLAGS>          m_flags;
-	std::vector<UINT>                            m_starts;
-	std::vector<UINT>                            m_counts;
-};
+using BlockPtr    = std::shared_ptr<gpu::Block>;
+using CommandsPtr = std::unique_ptr<gpu::Commands>;
+using HostPtr     = std::unique_ptr<gpu::HostBuffer>;
 
 struct SlotRange {
 	uint64_t first = 0;
@@ -229,12 +86,13 @@ struct Span {
 
 	static uint64_t bitOf(uint64_t index) { return 1ull << (index % kBitsPerWord); }
 
-	const uint64_t                           start;
-	const uint64_t                           bytes;
-	const SpanHome                           home;
-	std::unique_ptr<std::atomic<uint64_t>[]> asked;
-	std::vector<ComPtr<ID3D12Resource>>      buffers;
-	std::atomic<bool>                        made {false};
+	const uint64_t                            start;
+	const uint64_t                            bytes;
+	const SpanHome                            home;
+	std::unique_ptr<std::atomic<uint64_t>[]>  asked;
+	std::vector<std::unique_ptr<gpu::Region>> regions;
+	std::unique_ptr<gpu::Region>              flat;
+	std::atomic<bool>                         made {false};
 };
 
 class QueueTiles {
@@ -295,14 +153,14 @@ struct PageBytes {
 };
 
 struct Spent {
-	uint64_t   fence;
-	CommandSet commands;
-	HostBuffer upload;
+	uint64_t    fence;
+	CommandsPtr commands;
+	HostPtr     upload;
 };
 
 struct Retired {
-	uint64_t           fence;
-	ComPtr<ID3D12Heap> heap;
+	uint64_t fence;
+	BlockPtr block;
 };
 
 enum class Source : uint8_t { Loaded, Sending, Home };
@@ -321,12 +179,12 @@ struct Piece {
 };
 
 struct ReadPlan {
-	ID3D12Resource*          buffer  = nullptr;
+	const gpu::Region*       region  = nullptr;
 	uint64_t                 offset  = 0;
 	uint64_t                 version = 0;
 	std::vector<LoadedPiece> overlays;
-	CommandSet               commands;
-	HostBuffer               readback;
+	CommandsPtr              commands;
+	HostPtr                  readback;
 };
 
 void overlay(const LoadedPiece& piece, uint8_t* page) {
@@ -341,15 +199,15 @@ std::vector<Value> takeAll(std::vector<Value>& values) {
 }
 
 struct State {
-	using HeapMaker = std::function<ComPtr<ID3D12Heap>()>;
+	using HeapMaker = std::function<BlockPtr()>;
 
 	std::map<uint64_t, PageNumber>            shown;
 	std::map<uint64_t, SlotTile>              mapped;
 	std::unordered_map<PageNumber, PageTile>  tiles;
-	std::vector<ComPtr<ID3D12Heap>>           heaps;
+	std::vector<BlockPtr>                     heaps;
 	std::vector<uint32_t>                     used;
 	std::set<Tile>                            free;
-	std::vector<ComPtr<ID3D12Heap>>           retiring;
+	std::vector<BlockPtr>                     retiring;
 	std::vector<Retired>                      retired;
 	std::vector<SlotMove>                     moves;
 	std::unordered_set<PageNumber>            fills;
@@ -362,9 +220,9 @@ struct State {
 	std::set<uint64_t>                        noted;
 	std::unordered_map<PageNumber, bool>      tileNews;
 	QueueTiles                                onQueue;
-	std::vector<CommandSet>                   lists;
-	std::vector<HostBuffer>                   uploads;
-	std::vector<HostBuffer>                   readbacks;
+	std::vector<CommandsPtr>                  lists;
+	std::vector<HostPtr>                      uploads;
+	std::vector<HostPtr>                      readbacks;
 	std::vector<Spent>                        spent;
 	uint64_t                                  sequence  = 0;
 	uint64_t                                  tilesHeld = 0;
@@ -394,7 +252,7 @@ struct State {
 		return empty;
 	}
 
-	void addHeap(ComPtr<ID3D12Heap> heap) {
+	void addHeap(BlockPtr heap) {
 		auto vacant = std::find(heaps.begin(), heaps.end(), nullptr);
 		if (vacant == heaps.end()) {
 			heaps.push_back(nullptr);
@@ -410,7 +268,7 @@ struct State {
 
 	std::optional<Tile> take(const HeapMaker& makeHeap) {
 		if (free.empty()) {
-			ComPtr<ID3D12Heap> heap = makeHeap();
+			BlockPtr heap = makeHeap();
 			if (!heap) {
 				return std::nullopt;
 			}
@@ -418,19 +276,19 @@ struct State {
 		}
 		const Tile tile = *free.begin();
 		free.erase(free.begin());
-		++used[tile.heap];
+		++used[tile.block];
 		++tilesHeld;
 		return tile;
 	}
 
 	void freeTile(Tile tile) {
 		free.insert(tile);
-		--used[tile.heap];
+		--used[tile.block];
 		--tilesHeld;
-		if (isEmptyHeap(tile.heap) && emptyHeaps() > kSpareEmptyHeaps) {
-			free.erase(free.lower_bound(Tile {tile.heap, 0}),
-			           free.lower_bound(Tile {tile.heap + 1, 0}));
-			retiring.push_back(std::move(heaps[tile.heap]));
+		if (isEmptyHeap(tile.block) && emptyHeaps() > kSpareEmptyHeaps) {
+			free.erase(free.lower_bound(Tile {tile.block, 0}),
+			           free.lower_bound(Tile {tile.block + 1, 0}));
+			retiring.push_back(std::move(heaps[tile.block]));
 		}
 	}
 
@@ -635,28 +493,28 @@ struct State {
 
 } // namespace
 
-std::vector<Segment> segmentsOf(uint64_t spanBytes) {
+std::vector<Segment> segmentsOf(uint64_t spanBytes, gpu::SegmentShape shape) {
 	std::vector<Segment> segments;
-	for (uint64_t offset = 0; offset < spanBytes; offset += kSegmentStep) {
-		segments.push_back(Segment {offset, std::min(kSegmentBytes, spanBytes - offset)});
+	for (uint64_t offset = 0; offset < spanBytes; offset += shape.step) {
+		segments.push_back(Segment {offset, std::min(shape.bytes, spanBytes - offset)});
 	}
 	return segments;
 }
 
 std::optional<size_t> segmentHolding(uint64_t spanStart, uint64_t spanBytes, uint64_t from,
-                                     uint64_t to) {
-	const uint64_t index  = (from - spanStart) / kSegmentStep;
-	const uint64_t offset = index * kSegmentStep;
+                                     uint64_t to, gpu::SegmentShape shape) {
+	const uint64_t index  = (from - spanStart) / shape.step;
+	const uint64_t offset = index * shape.step;
 	if (offset >= spanBytes ||
-	    to > spanStart + offset + std::min(kSegmentBytes, spanBytes - offset)) {
+	    to > spanStart + offset + std::min(shape.bytes, spanBytes - offset)) {
 		return std::nullopt;
 	}
 	return static_cast<size_t>(index);
 }
 
-Place placeOf(uint64_t spanStart, uint64_t gpuAddress) {
-	const uint64_t index = (gpuAddress - spanStart) / kSegmentStep;
-	return Place {static_cast<size_t>(index), gpuAddress - spanStart - index * kSegmentStep};
+Place placeOf(uint64_t spanStart, uint64_t gpuAddress, gpu::SegmentShape shape) {
+	const uint64_t index = (gpuAddress - spanStart) / shape.step;
+	return Place {static_cast<size_t>(index), gpuAddress - spanStart - index * shape.step};
 }
 
 std::vector<SlotMove> lastMoves(std::vector<SlotMove> moves) {
@@ -672,73 +530,24 @@ std::vector<SlotMove> lastMoves(std::vector<SlotMove> moves) {
 	return result;
 }
 
-uint32_t mapTiles(ID3D12CommandQueue* queue, ID3D12Resource* buffer,
-                  std::span<const ComPtr<ID3D12Heap>> heaps, std::span<const SlotMove> moves) {
-	Mapping                     unmapped;
-	std::map<uint32_t, Mapping> byHeap;
-	for (const SlotMove& move: moves) {
-		if (move.tile) {
-			byHeap[move.tile->heap].add(move.slot, move.tile->index);
-		} else {
-			unmapped.add(move.slot, std::nullopt);
-		}
-	}
-	uint32_t calls = 0;
-	for (auto& [heap, mapping]: byHeap) {
-		if (!unmapped.empty()) {
-			mapping.append(unmapped);
-			unmapped = Mapping {};
-		}
-		calls += mapping.send(queue, buffer, heaps[heap].Get());
-	}
-	return calls + unmapped.send(queue, buffer, nullptr);
-}
-
-HRESULT makeTileHeap(ID3D12Device* device, ComPtr<ID3D12Heap>* heap) {
-	D3D12_HEAP_DESC desc {};
-	desc.SizeInBytes     = uint64_t {kHeapTiles} * kTileBytes;
-	desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-	desc.Alignment       = kTileBytes;
-	desc.Flags           = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
-	const HRESULT result = device->CreateHeap(&desc, IID_PPV_ARGS(heap->ReleaseAndGetAddressOf()));
-	if (SUCCEEDED(result)) {
-		(*heap)->SetName(kHeapName);
-	}
-	return result;
-}
-
-HRESULT makeReservedBuffer(ID3D12Device* device, uint64_t bytes, ComPtr<ID3D12Resource>* buffer) {
-	const D3D12_RESOURCE_DESC desc = bufferDesc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-	return device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-	                                      IID_PPV_ARGS(buffer->ReleaseAndGetAddressOf()));
-}
-
-bool hasTiledResourcesTier2(ID3D12Device* device) {
-	D3D12_FEATURE_DATA_D3D12_OPTIONS options {};
-	return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
-	                                             sizeof(options))) &&
-	       options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2;
-}
-
 struct Engine::Impl {
-	Impl(ID3D12Device* device, ID3D12CommandQueue* queue, Surroundings& surroundings)
-	    : device(device), queue(queue), surroundings(surroundings),
-	      makeHeap([this] { return newHeap(); }) {}
+	Impl(gpu::Backend& backend, Surroundings& surroundings)
+	    : backend(backend), surroundings(surroundings), makeHeap([this] { return newHeap(); }) {}
 
 	~Impl() {
-		if (fence) {
+		if (started) {
 			std::unique_lock order(queueOrder);
-			const uint64_t   value = signal();
+			const uint64_t   value = backend.signal();
 			order.unlock();
-			waitFor(value);
+			backend.wait(value);
 		}
 	}
 
-	ComPtr<ID3D12Device>                         device;
-	ComPtr<ID3D12CommandQueue>                   queue;
+	gpu::Backend&                                backend;
 	Surroundings&                                surroundings;
 	State::HeapMaker                             makeHeap;
-	ComPtr<ID3D12Fence>                          fence;
+	bool                                         started = false;
+	gpu::SegmentShape                            shape;
 	std::array<std::unique_ptr<Span>, kMaxSpans> spans;
 	std::atomic<uint32_t>                        spanCount {0};
 	std::mutex                                   adding;
@@ -746,15 +555,13 @@ struct Engine::Impl {
 	std::mutex                                   queueOrder;
 	mutable std::mutex                           stateLock;
 	State                                        state;
-	uint64_t                                     fenced = 0;
 
-	ComPtr<ID3D12Heap> newHeap() {
-		ComPtr<ID3D12Heap> heap;
-		if (FAILED(makeTileHeap(device.Get(), &heap))) {
+	BlockPtr newHeap() {
+		BlockPtr block;
+		if (backend.makeBlock(&block) != Status::Ok) {
 			return nullptr;
 		}
-		surroundings.heapMade(heap.Get());
-		return heap;
+		return block;
 	}
 
 	Span* spanHolding(uint64_t address) const {
@@ -767,24 +574,10 @@ struct Engine::Impl {
 		return nullptr;
 	}
 
-	std::pair<ID3D12Resource*, uint64_t> bufferAt(uint64_t slot) const {
+	std::pair<const gpu::Region*, uint64_t> bufferAt(uint64_t slot) const {
 		const Span* span  = spanHolding(addressOf(slot));
-		const Place place = placeOf(span->start, addressOf(slot));
-		return {span->buffers[place.segment].Get(), place.offset};
-	}
-
-	uint64_t signal() {
-		++fenced;
-		queue->Signal(fence.Get(), fenced);
-		return fenced;
-	}
-
-	bool waitFor(uint64_t value) const {
-		if (fence->GetCompletedValue() < value &&
-		    FAILED(fence->SetEventOnCompletion(value, nullptr))) {
-			return false;
-		}
-		return fence->GetCompletedValue() != kDeviceRemoved;
+		const Place place = placeOf(span->start, addressOf(slot), shape);
+		return {span->regions[place.segment].get(), place.offset};
 	}
 
 	void tellPages() {
@@ -808,40 +601,34 @@ struct Engine::Impl {
 		}
 	}
 
-	Status takeCommands(CommandSet* commands) {
+	Status takeCommands(CommandsPtr* commands) {
 		if (!state.lists.empty()) {
 			*commands = std::move(state.lists.back());
 			state.lists.pop_back();
 			return Status::Ok;
 		}
-		const HRESULT result = makeCommandSet(device.Get(), commands);
-		return FAILED(result) ? statusOf(result) : Status::Ok;
+		return backend.makeCommands(commands);
 	}
 
-	Status takeHostBuffer(std::vector<HostBuffer>& pool, D3D12_HEAP_TYPE type, uint64_t bytes,
-	                      HostBuffer* buffer) {
+	Status takeHostBuffer(std::vector<HostPtr>& pool, bool upload, uint64_t bytes,
+	                      HostPtr* buffer) {
 		auto fits = std::find_if(pool.begin(), pool.end(),
-		                         [bytes](const HostBuffer& held) { return held.bytes >= bytes; });
+		                         [bytes](const HostPtr& held) { return held->bytes >= bytes; });
 		if (fits != pool.end()) {
 			*buffer = std::move(*fits);
 			pool.erase(fits);
 			return Status::Ok;
 		}
-		const HRESULT result = makeHostBuffer(device.Get(), type, bytes, buffer);
-		if (FAILED(result)) {
-			return statusOf(result);
-		}
-		surroundings.bufferMade(buffer->resource.Get());
-		return Status::Ok;
+		return upload ? backend.makeUpload(bytes, buffer) : backend.makeReadback(bytes, buffer);
 	}
 
-	Status takeUpload(uint64_t bytes, HostBuffer* buffer) {
-		return takeHostBuffer(state.uploads, D3D12_HEAP_TYPE_UPLOAD,
+	Status takeUpload(uint64_t bytes, HostPtr* buffer) {
+		return takeHostBuffer(state.uploads, true,
 		                      std::bit_ceil(std::max(bytes, kUploadLeastBytes)), buffer);
 	}
 
 	void recycle() {
-		const uint64_t     done = fence->GetCompletedValue();
+		const uint64_t     done = backend.completed();
 		std::lock_guard    lock(stateLock);
 		std::vector<Spent> waiting;
 		for (Spent& spent: state.spent) {
@@ -880,17 +667,23 @@ struct Engine::Impl {
 		if (span.made.load(std::memory_order_relaxed)) {
 			return Status::Ok;
 		}
-		std::vector<ComPtr<ID3D12Resource>> buffers;
-		for (const Segment& segment: segmentsOf(span.bytes)) {
-			ComPtr<ID3D12Resource> buffer;
-			const HRESULT result = makeReservedBuffer(device.Get(), segment.bytes, &buffer);
-			if (FAILED(result)) {
-				return statusOf(result);
+		const std::vector<Segment>                segments = segmentsOf(span.bytes, shape);
+		std::vector<std::unique_ptr<gpu::Region>> regions(segments.size());
+		for (size_t k = 0; k < segments.size(); ++k) {
+			const Status status = backend.makeRegion(segments[k].bytes, &regions[k]);
+			if (status != Status::Ok) {
+				return status;
 			}
-			buffer->SetName(kSegmentName);
-			buffers.push_back(std::move(buffer));
 		}
-		span.buffers = std::move(buffers);
+		std::unique_ptr<gpu::Region> flat;
+		if (backend.flatSpans() && segments.front().bytes != span.bytes) {
+			const Status status = backend.makeRegion(span.bytes, &flat);
+			if (status != Status::Ok) {
+				return status;
+			}
+		}
+		span.regions = std::move(regions);
+		span.flat    = std::move(flat);
 		span.made.store(true, std::memory_order_release);
 		return Status::Ok;
 	}
@@ -941,7 +734,7 @@ struct Engine::Impl {
 		}
 		const Range asked = bytes == 0 ? blockAround(gpuAddress, *span) : Range {gpuAddress, bytes};
 		const std::optional<size_t> segment =
-		    segmentHolding(span->start, span->bytes, asked.start, asked.end());
+		    segmentHolding(span->start, span->bytes, asked.start, asked.end(), shape);
 		if (asked.bytes > kLargestAskBytes || !segment) {
 			std::lock_guard lock(stateLock);
 			++state.counters.tooLargeAsks;
@@ -956,9 +749,8 @@ struct Engine::Impl {
 		if (status != Status::Ok) {
 			return status;
 		}
-		view->resource = span->buffers[*segment].Get();
-		view->offset   = gpuAddress - span->start - *segment * kSegmentStep;
-		view->bytes    = asked.end() - gpuAddress;
+		*view = span->regions[*segment]->view(gpuAddress - span->start - *segment * shape.step,
+		                                      asked.end() - gpuAddress);
 		return Status::Ok;
 	}
 
@@ -1006,12 +798,11 @@ struct Engine::Impl {
 		if (!slot) {
 			return Planned::Lost;
 		}
-		std::tie(plan.buffer, plan.offset) = bufferAt(*slot);
+		std::tie(plan.region, plan.offset) = bufferAt(*slot);
 		plan.version                       = state.versionOf(page);
 		plan.overlays                      = state.loadedOf(page, 0);
 		if (takeCommands(&plan.commands) != Status::Ok ||
-		    takeHostBuffer(state.readbacks, D3D12_HEAP_TYPE_READBACK, kPageBytes, &plan.readback) !=
-		        Status::Ok) {
+		    takeHostBuffer(state.readbacks, false, kPageBytes, &plan.readback) != Status::Ok) {
 			return Planned::Lost;
 		}
 		return Planned::Copy;
@@ -1019,23 +810,21 @@ struct Engine::Impl {
 
 	bool copyTile(const ReadPlan& plan, uint64_t* value) {
 		std::lock_guard order(queueOrder);
-		if (FAILED(beginCommands(plan.commands))) {
+		if (backend.begin(*plan.commands) != Status::Ok) {
 			return false;
 		}
-		plan.commands.list->CopyBufferRegion(plan.readback.resource.Get(), 0, plan.buffer,
-		                                     plan.offset, kPageBytes);
-		if (FAILED(plan.commands.list->Close())) {
+		backend.copyBack(*plan.commands, *plan.readback, *plan.region, plan.offset, kPageBytes);
+		if (backend.end(*plan.commands) != Status::Ok) {
 			return false;
 		}
-		execute(queue.Get(), plan.commands);
-		*value = signal();
+		*value = backend.submit(*plan.commands);
 		return true;
 	}
 
 	bool finishReadBack(PageNumber page, ReadPlan& plan, bool copied, uint8_t* out) {
 		std::lock_guard lock(stateLock);
 		if (copied) {
-			std::memcpy(out, plan.readback.data, kPageBytes);
+			std::memcpy(out, plan.readback->data, kPageBytes);
 			for (const LoadedPiece& piece: plan.overlays) {
 				overlay(piece, out);
 			}
@@ -1054,7 +843,7 @@ struct Engine::Impl {
 				return planned == Planned::Done;
 			}
 			uint64_t   value  = 0;
-			const bool copied = copyTile(plan, &value) && waitFor(value);
+			const bool copied = copyTile(plan, &value) && backend.wait(value);
 			if (finishReadBack(page, plan, copied, out)) {
 				return copied;
 			}
@@ -1125,8 +914,22 @@ struct Engine::Impl {
 		}
 	}
 
-	uint32_t mapSegments(const std::vector<SlotMove>&           moves,
-	                     const std::vector<ComPtr<ID3D12Heap>>& heaps) {
+	uint32_t mapRegion(gpu::Region& region, uint64_t first, uint64_t last,
+	                   const std::vector<SlotMove>& moves, std::span<gpu::Block* const> blocks) {
+		std::vector<SlotMove> inside;
+		for (const SlotMove& move: moves) {
+			if (first <= move.slot && move.slot < last) {
+				inside.push_back(SlotMove {move.slot - first, move.tile});
+			}
+		}
+		const std::vector<gpu::BindGroup> groups = gpu::bindGroups(inside);
+		if (!groups.empty()) {
+			backend.bind(region, groups, blocks);
+		}
+		return static_cast<uint32_t>(groups.size());
+	}
+
+	uint32_t mapSegments(const std::vector<SlotMove>& moves, std::span<gpu::Block* const> blocks) {
 		uint32_t       calls = 0;
 		const uint32_t count = spanCount.load(std::memory_order_acquire);
 		for (uint32_t i = 0; i < count; ++i) {
@@ -1134,27 +937,25 @@ struct Engine::Impl {
 			if (!span.made.load(std::memory_order_acquire)) {
 				continue;
 			}
-			const std::vector<Segment> segments = segmentsOf(span.bytes);
+			const std::vector<Segment> segments = segmentsOf(span.bytes, shape);
 			for (size_t k = 0; k < segments.size(); ++k) {
-				const uint64_t        first = slotOf(span.start + segments[k].offset);
-				const uint64_t        last  = first + slotOf(segments[k].bytes);
-				std::vector<SlotMove> inside;
-				for (const SlotMove& move: moves) {
-					if (first <= move.slot && move.slot < last) {
-						inside.push_back(SlotMove {move.slot - first, move.tile});
-					}
-				}
-				calls += mapTiles(queue.Get(), span.buffers[k].Get(), heaps, inside);
+				const uint64_t first = slotOf(span.start + segments[k].offset);
+				calls += mapRegion(*span.regions[k], first, first + slotOf(segments[k].bytes),
+				                   moves, blocks);
+			}
+			if (span.flat) {
+				calls +=
+				    mapRegion(*span.flat, slotOf(span.start), slotOf(span.end()), moves, blocks);
 			}
 		}
 		return calls;
 	}
 
 	void sendMoves() {
-		std::lock_guard                 order(queueOrder);
-		std::vector<SlotMove>           moves;
-		std::vector<ComPtr<ID3D12Heap>> heaps;
-		std::vector<ComPtr<ID3D12Heap>> retiring;
+		std::lock_guard       order(queueOrder);
+		std::vector<SlotMove> moves;
+		std::vector<BlockPtr> heaps;
+		std::vector<BlockPtr> retiring;
 		{
 			std::lock_guard lock(stateLock);
 			moves    = lastMoves(takeAll(state.moves));
@@ -1164,13 +965,16 @@ struct Engine::Impl {
 		if (moves.empty() && retiring.empty()) {
 			return;
 		}
-		const uint32_t  calls = mapSegments(moves, heaps);
-		const uint64_t  value = signal();
+		std::vector<gpu::Block*> blocks(heaps.size());
+		std::transform(heaps.begin(), heaps.end(), blocks.begin(),
+		               [](const BlockPtr& heap) { return heap.get(); });
+		const uint32_t  calls = mapSegments(moves, blocks);
+		const uint64_t  value = backend.submitBinds();
 		std::lock_guard lock(stateLock);
 		for (const SlotMove& move: moves) {
 			state.onQueue.set(move.slot, move.tile);
 		}
-		for (ComPtr<ID3D12Heap>& heap: retiring) {
+		for (BlockPtr& heap: retiring) {
 			state.retired.push_back(Retired {value, std::move(heap)});
 		}
 		state.counters.mappingCalls += calls;
@@ -1260,7 +1064,7 @@ struct Engine::Impl {
 	}
 
 	Status gatherFills(const std::vector<PageNumber>& written, std::vector<Piece>& pieces,
-	                   HostBuffer* upload, CommandSet* commands) {
+	                   HostPtr* upload, CommandsPtr* commands) {
 		std::lock_guard lock(stateLock);
 		gatherPieces(written, pieces);
 		uint64_t total = 0;
@@ -1279,13 +1083,13 @@ struct Engine::Impl {
 			for (const Piece& piece: pieces) {
 				state.requeue(piece);
 			}
-			if (upload->resource) {
+			if (*upload) {
 				state.uploads.push_back(std::move(*upload));
 			}
 			pieces.clear();
 			return status;
 		}
-		copyHeldBytes(pieces, upload->data);
+		copyHeldBytes(pieces, (*upload)->data);
 		return Status::Ok;
 	}
 
@@ -1352,41 +1156,41 @@ struct Engine::Impl {
 		return fates;
 	}
 
-	std::vector<Fate> recordFills(const std::vector<Piece>& pieces, const HostBuffer& upload,
-	                              const CommandSet& commands) {
+	std::vector<Fate> recordFills(const std::vector<Piece>& pieces, const gpu::HostBuffer& upload,
+	                              gpu::Commands& commands) {
 		std::vector<Fate> fates = fatesOf(pieces, upload.data);
 		for (size_t i = 0; i < pieces.size(); ++i) {
 			if (fates[i] != Fate::Copy) {
 				continue;
 			}
 			const Piece& piece          = pieces[i];
-			const auto [buffer, offset] = bufferAt(*state.onQueue.slotShowing(piece.tile));
-			commands.list->CopyBufferRegion(buffer, offset + piece.offset, upload.resource.Get(),
-			                                piece.uploadOffset, piece.bytes);
+			const auto [region, offset] = bufferAt(*state.onQueue.slotShowing(piece.tile));
+			backend.copyUp(commands, *region, offset + piece.offset, upload, piece.uploadOffset,
+			               piece.bytes);
 			state.counters.fillBytes += piece.bytes;
 		}
 		return fates;
 	}
 
-	Status sendFills(const std::vector<Piece>& pieces, HostBuffer upload, CommandSet commands) {
+	Status sendFills(const std::vector<Piece>& pieces, HostPtr upload, CommandsPtr commands) {
 		std::lock_guard   order(queueOrder);
 		std::lock_guard   lock(stateLock);
 		std::vector<Fate> fates;
-		HRESULT           result = beginCommands(commands);
-		if (SUCCEEDED(result)) {
-			fates  = recordFills(pieces, upload, commands);
-			result = commands.list->Close();
+		Status            status = backend.begin(*commands);
+		if (status == Status::Ok) {
+			fates  = recordFills(pieces, *upload, *commands);
+			status = backend.end(*commands);
 		}
-		if (FAILED(result)) {
+		if (status != Status::Ok) {
 			for (const Piece& piece: pieces) {
 				state.requeue(piece);
 			}
 			state.lists.push_back(std::move(commands));
 			state.uploads.push_back(std::move(upload));
-			return statusOf(result);
+			return status;
 		}
-		execute(queue.Get(), commands);
-		state.spent.push_back(Spent {signal(), std::move(commands), std::move(upload)});
+		const uint64_t value = backend.submit(*commands);
+		state.spent.push_back(Spent {value, std::move(commands), std::move(upload)});
 		for (size_t i = 0; i < pieces.size(); ++i) {
 			if (fates[i] != Fate::Kept) {
 				state.sent(pieces[i]);
@@ -1395,6 +1199,11 @@ struct Engine::Impl {
 			}
 		}
 		return Status::Ok;
+	}
+
+	void fenceTitleWork() {
+		std::lock_guard order(queueOrder);
+		backend.fenceTitleWork();
 	}
 
 	bool hasTiles() const {
@@ -1408,13 +1217,13 @@ struct Engine::Impl {
 			surroundings.takeWritten(written);
 		}
 		std::vector<Piece> pieces;
-		HostBuffer         upload;
-		CommandSet         commands;
+		HostPtr            upload;
+		CommandsPtr        commands;
 		const Status       status = gatherFills(written, pieces, &upload, &commands);
 		if (status != Status::Ok || pieces.empty()) {
 			return status;
 		}
-		readFromHomes(pieces, upload.data);
+		readFromHomes(pieces, upload->data);
 		return sendFills(pieces, std::move(upload), std::move(commands));
 	}
 
@@ -1441,6 +1250,7 @@ struct Engine::Impl {
 		sendMoves();
 		takeHomeClosing();
 		const Status status = fill();
+		fenceTitleWork();
 		notifyShaderWrites();
 		tellPages();
 		surroundings.deliverChanges();
@@ -1457,18 +1267,18 @@ struct Engine::Impl {
 	}
 };
 
-Engine::Engine(ID3D12Device* device, ID3D12CommandQueue* queue, Surroundings& surroundings)
-    : m_impl(std::make_unique<Impl>(device, queue, surroundings)) {}
+Engine::Engine(gpu::Backend& backend, Surroundings& surroundings)
+    : m_impl(std::make_unique<Impl>(backend, surroundings)) {}
 
 Engine::~Engine() = default;
 
 Status Engine::start() {
-	if (!hasTiledResourcesTier2(m_impl->device.Get())) {
-		return Status::NotSupported;
+	const Status status = m_impl->backend.start();
+	if (status == Status::Ok) {
+		m_impl->started = true;
+		m_impl->shape   = m_impl->backend.segmentShape();
 	}
-	const HRESULT result =
-	    m_impl->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_impl->fence));
-	return FAILED(result) ? statusOf(result) : Status::Ok;
+	return status;
 }
 
 Status Engine::addSpan(uint64_t gpuBase, uint64_t bytes, SpanHome home) {
@@ -1543,7 +1353,11 @@ namespace deunify {
 
 struct CardView::Impl final: cardview::Surroundings {
 	explicit Impl(Context& context)
-	    : context(context), engine(context.config().device, context.config().queue, *this) {}
+	    : context(context), backend(gpu::makeBackend(context.config(), context.callbacks(),
+	                                                 context.census().ledger())),
+	      engine(*backend, *this) {
+		context.census().attach(backend.get());
+	}
 
 	bool bytesForTile(PageNumber page, uint8_t* out) override {
 		return context.pages().bytesForTile(page, out);
@@ -1581,17 +1395,9 @@ struct CardView::Impl final: cardview::Surroundings {
 		return std::nullopt;
 	}
 
-	void heapMade(ID3D12Heap* heap) override {
-		static_cast<void>(context.census().track(heap, kCardViewCategory));
-	}
-
-	void bufferMade(ID3D12Resource* buffer) override {
-		static_cast<void>(
-		    context.census().track(context.config().device, buffer, kCardViewCategory));
-	}
-
-	Context&         context;
-	cardview::Engine engine;
+	Context&                      context;
+	std::unique_ptr<gpu::Backend> backend;
+	cardview::Engine              engine;
 };
 
 CardView::CardView(Context& context): m_context(context), m_impl(std::make_unique<Impl>(context)) {}

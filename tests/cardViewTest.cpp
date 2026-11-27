@@ -1,11 +1,11 @@
 #include "../src/cardViewEngine.hpp"
+#include "../src/censusLedger.hpp"
 #include "deunify/cardView.hpp"
 #include "deunify/context.hpp"
 #include "deunify/gpuPageTable.hpp"
 #include "deunify/loads.hpp"
 #include "deunify/physicalMemory.hpp"
-
-#include "warp.hpp"
+#include "testCard.hpp"
 
 #include <cstring>
 #include <gtest/gtest.h>
@@ -20,11 +20,13 @@ using deunify::PageNumber;
 using deunify::Range;
 using deunify::SpanHome;
 using deunify::Status;
-using deunify::cardview::ComPtr;
 using deunify::cardview::Engine;
 using deunify::cardview::SlotMove;
 using deunify::cardview::Tile;
-using deunify::test::Warp;
+using deunify::gpu::BindGroup;
+using Runs = std::vector<deunify::gpu::Run>;
+using deunify::test::Api;
+using deunify::test::TestCard;
 
 constexpr uint64_t kGiB      = 1ull << 30;
 constexpr uint64_t kBase     = 0x10'0000'0000ull;
@@ -98,26 +100,24 @@ public:
 
 	std::optional<Range> regionOf(uint64_t) override { return std::nullopt; }
 
-	void heapMade(ID3D12Heap*) override { ++heaps; }
-
-	void bufferMade(ID3D12Resource*) override {}
-
 	std::map<PageNumber, std::vector<uint8_t>> ram;
 	std::set<PageNumber>                       card;
 	std::vector<PageNumber>                    written;
 	std::vector<PageNumber>                    cameHome;
 	std::map<PageNumber, bool>                 tiles;
 	std::vector<Range>                         shaderWrites;
-	int                                        heaps = 0;
 };
 
-class CardViewOnWarp: public ::testing::Test {
+class CardViewOnCard: public ::testing::TestWithParam<Api> {
 protected:
 	void SetUp() override {
-		if (!warp.tiled()) {
-			GTEST_SKIP() << "WARP without tiled resources tier 2";
+		card = deunify::test::makeTestCard(GetParam());
+		if (const std::string missing = card->missing(); !missing.empty()) {
+			GTEST_SKIP() << missing;
 		}
-		engine = std::make_unique<Engine>(warp.device.Get(), warp.queue.Get(), home);
+		ledger->addCategory("card view");
+		backend = deunify::gpu::makeBackend(card->config(), deunify::Callbacks {}, ledger);
+		engine  = std::make_unique<Engine>(*backend, home);
 		ASSERT_EQ(engine->start(), Status::Ok);
 	}
 
@@ -127,10 +127,27 @@ protected:
 		return bytes;
 	}
 
-	Warp                    warp;
-	Home                    home;
-	std::unique_ptr<Engine> engine;
+	uint32_t bind(deunify::gpu::Region& region, std::span<deunify::gpu::Block* const> blocks,
+	              const std::vector<SlotMove>& moves) {
+		const std::vector<BindGroup> groups = deunify::gpu::bindGroups(moves);
+		backend->bind(region, groups, blocks);
+		backend->submitBinds();
+		return static_cast<uint32_t>(groups.size());
+	}
+
+	uint64_t cardHeaps() const { return ledger->uses()[0].cardCount; }
+
+	bool zeros() const { return backend->unboundReadsZero(); }
+
+	std::unique_ptr<TestCard>                card;
+	std::shared_ptr<deunify::detail::Ledger> ledger = std::make_shared<deunify::detail::Ledger>();
+	Home                                     home;
+	std::unique_ptr<deunify::gpu::Backend>   backend;
+	std::unique_ptr<Engine>                  engine;
 };
+
+INSTANTIATE_TEST_SUITE_P(Backends, CardViewOnCard, ::testing::ValuesIn(deunify::test::kApis),
+                         deunify::test::apiName);
 
 TEST(CardView, EveryTwoGiBViewFitsInOneSegment) {
 	static_assert(deunify::kSegmentBytes - deunify::kSegmentStep >= (2ull << 30));
@@ -170,54 +187,83 @@ TEST(CardView, OnlyTheLastMoveOfASlotCounts) {
 	EXPECT_EQ(moves, expected);
 }
 
-TEST_F(CardViewOnWarp, RunsAndTheirUnmappingsGoUpInOneCallPerHeap) {
-	std::vector<ComPtr<ID3D12Heap>> heaps(2);
-	ASSERT_HRESULT_SUCCEEDED(deunify::cardview::makeTileHeap(warp.device.Get(), &heaps[0]));
-	ASSERT_HRESULT_SUCCEEDED(deunify::cardview::makeTileHeap(warp.device.Get(), &heaps[1]));
-	ComPtr<ID3D12Resource> buffer;
-	ASSERT_HRESULT_SUCCEEDED(
-	    deunify::cardview::makeReservedBuffer(warp.device.Get(), 6 * kPageBytes, &buffer));
-	const std::vector<SlotMove> first = {
-	    {0, Tile {0, 0}}, {1, Tile {0, 1}}, {2, Tile {1, 0}}, {3, Tile {1, 1}}, {4, Tile {0, 2}}};
-	EXPECT_EQ(deunify::cardview::mapTiles(warp.queue.Get(), buffer.Get(), heaps, first), 2u);
-	for (uint8_t i = 0; i < 5; ++i) {
-		warp.store(buffer.Get(), i * kPageBytes, filled(kProbe, static_cast<uint8_t>(i + 1)));
-	}
-	const std::vector<SlotMove> second = {{4, std::nullopt}, {5, Tile {0, 1}}};
-	EXPECT_EQ(deunify::cardview::mapTiles(warp.queue.Get(), buffer.Get(), heaps, second), 1u);
-	EXPECT_EQ(warp.fetch(buffer.Get(), 4 * kPageBytes, kProbe), filled(kProbe, 0));
-	EXPECT_EQ(warp.fetch(buffer.Get(), 5 * kPageBytes, kProbe), filled(kProbe, 2));
-	const std::vector<SlotMove> third = {{5, Tile {1, 1}}};
-	deunify::cardview::mapTiles(warp.queue.Get(), buffer.Get(), heaps, third);
-	EXPECT_EQ(warp.fetch(buffer.Get(), 5 * kPageBytes, kProbe), filled(kProbe, 4));
-	EXPECT_EQ(warp.fetch(buffer.Get(), 0, kProbe), filled(kProbe, 1));
-	EXPECT_EQ(warp.fetch(buffer.Get(), 2 * kPageBytes, kProbe), filled(kProbe, 3));
-	const std::vector<SlotMove> unmapOnly = {{0, std::nullopt}, {1, std::nullopt}};
-	EXPECT_EQ(deunify::cardview::mapTiles(warp.queue.Get(), buffer.Get(), heaps, unmapOnly), 1u);
+TEST(CardView, MovesGoUpAsRunsGroupedByBlock) {
+	const std::vector<SlotMove>  moves  = {{0, Tile {0, 0}},  {1, Tile {0, 1}}, {2, Tile {1, 0}},
+	                                       {3, Tile {1, 1}},  {4, Tile {0, 2}}, {5, std::nullopt},
+	                                       {6, std::nullopt}, {8, Tile {0, 3}}};
+	const std::vector<BindGroup> groups = deunify::gpu::bindGroups(moves);
+	ASSERT_EQ(groups.size(), 2u);
+	EXPECT_EQ(groups[0].block, 0u);
+	const Runs first = {{0, 2, 0}, {4, 1, 2}, {8, 1, 3}, {5, 2, std::nullopt}};
+	EXPECT_EQ(groups[0].runs, first);
+	EXPECT_EQ(groups[1].block, 1u);
+	EXPECT_EQ(groups[1].runs, (Runs {{2, 2, 0}}));
+	const std::vector<SlotMove>  unbindOnly = {{3, std::nullopt}, {4, std::nullopt}};
+	const std::vector<BindGroup> alone      = deunify::gpu::bindGroups(unbindOnly);
+	ASSERT_EQ(alone.size(), 1u);
+	EXPECT_FALSE(alone[0].block.has_value());
+	EXPECT_EQ(alone[0].runs, (Runs {{3, 2, std::nullopt}}));
 }
 
-TEST_F(CardViewOnWarp, SlotsShowTheirTilesAndNothingOnceUnmapped) {
-	std::vector<ComPtr<ID3D12Heap>> heaps(1);
-	ASSERT_HRESULT_SUCCEEDED(deunify::cardview::makeTileHeap(warp.device.Get(), &heaps[0]));
-	ComPtr<ID3D12Resource> buffer;
-	ASSERT_HRESULT_SUCCEEDED(
-	    deunify::cardview::makeReservedBuffer(warp.device.Get(), 4 * kPageBytes, &buffer));
+TEST_P(CardViewOnCard, RunsAndTheirUnmappingsGoUpInOneCallPerHeap) {
+	std::shared_ptr<deunify::gpu::Block> a;
+	std::shared_ptr<deunify::gpu::Block> b;
+	ASSERT_EQ(backend->makeBlock(&a), Status::Ok);
+	ASSERT_EQ(backend->makeBlock(&b), Status::Ok);
+	const std::vector<deunify::gpu::Block*> heaps = {a.get(), b.get()};
+	std::unique_ptr<deunify::gpu::Region>   region;
+	ASSERT_EQ(backend->makeRegion(6 * kPageBytes, &region), Status::Ok);
+	const BufferView            buffer = region->view(0, 6 * kPageBytes);
+	const std::vector<SlotMove> first  = {
+	    {0, Tile {0, 0}}, {1, Tile {0, 1}}, {2, Tile {1, 0}}, {3, Tile {1, 1}}, {4, Tile {0, 2}}};
+	EXPECT_EQ(bind(*region, heaps, first), 2u);
+	for (uint8_t i = 0; i < 5; ++i) {
+		card->store(buffer, i * kPageBytes, filled(kProbe, static_cast<uint8_t>(i + 1)));
+	}
+	const std::vector<SlotMove> second = {{4, std::nullopt}, {5, Tile {0, 1}}};
+	EXPECT_EQ(bind(*region, heaps, second), 1u);
+	if (zeros()) {
+		EXPECT_EQ(card->fetch(buffer, 4 * kPageBytes, kProbe), filled(kProbe, 0));
+	}
+	EXPECT_EQ(card->fetch(buffer, 5 * kPageBytes, kProbe), filled(kProbe, 2));
+	const std::vector<SlotMove> third = {{5, Tile {1, 1}}};
+	bind(*region, heaps, third);
+	EXPECT_EQ(card->fetch(buffer, 5 * kPageBytes, kProbe), filled(kProbe, 4));
+	EXPECT_EQ(card->fetch(buffer, 0, kProbe), filled(kProbe, 1));
+	EXPECT_EQ(card->fetch(buffer, 2 * kPageBytes, kProbe), filled(kProbe, 3));
+	const std::vector<SlotMove> unmapOnly = {{0, std::nullopt}, {1, std::nullopt}};
+	EXPECT_EQ(bind(*region, heaps, unmapOnly), 1u);
+	card->drain();
+}
+
+TEST_P(CardViewOnCard, SlotsShowTheirTilesAndNothingOnceUnmapped) {
+	std::shared_ptr<deunify::gpu::Block> block;
+	ASSERT_EQ(backend->makeBlock(&block), Status::Ok);
+	const std::vector<deunify::gpu::Block*> heaps = {block.get()};
+	std::unique_ptr<deunify::gpu::Region>   region;
+	ASSERT_EQ(backend->makeRegion(4 * kPageBytes, &region), Status::Ok);
+	const BufferView            buffer = region->view(0, 4 * kPageBytes);
 	const Tile                  a {0, 2};
 	const Tile                  b {0, 0};
 	const std::vector<SlotMove> mapped = {{0, a}, {1, b}, {2, a}};
-	deunify::cardview::mapTiles(warp.queue.Get(), buffer.Get(), heaps, mapped);
-	warp.store(buffer.Get(), 0, filled(kProbe, 0x11));
-	warp.store(buffer.Get(), kPageBytes, filled(kProbe, 0x22));
-	EXPECT_EQ(warp.fetch(buffer.Get(), 2 * kPageBytes, kProbe), filled(kProbe, 0x11));
-	EXPECT_EQ(warp.fetch(buffer.Get(), kPageBytes, kProbe), filled(kProbe, 0x22));
-	EXPECT_EQ(warp.fetch(buffer.Get(), 3 * kPageBytes, kProbe), filled(kProbe, 0));
+	bind(*region, heaps, mapped);
+	card->store(buffer, 0, filled(kProbe, 0x11));
+	card->store(buffer, kPageBytes, filled(kProbe, 0x22));
+	EXPECT_EQ(card->fetch(buffer, 2 * kPageBytes, kProbe), filled(kProbe, 0x11));
+	EXPECT_EQ(card->fetch(buffer, kPageBytes, kProbe), filled(kProbe, 0x22));
+	if (zeros()) {
+		EXPECT_EQ(card->fetch(buffer, 3 * kPageBytes, kProbe), filled(kProbe, 0));
+	}
 	const std::vector<SlotMove> unmapped = {{0, std::nullopt}};
-	deunify::cardview::mapTiles(warp.queue.Get(), buffer.Get(), heaps, unmapped);
-	EXPECT_EQ(warp.fetch(buffer.Get(), 0, kProbe), filled(kProbe, 0));
-	EXPECT_EQ(warp.fetch(buffer.Get(), 2 * kPageBytes, kProbe), filled(kProbe, 0x11));
+	bind(*region, heaps, unmapped);
+	if (zeros()) {
+		EXPECT_EQ(card->fetch(buffer, 0, kProbe), filled(kProbe, 0));
+	}
+	EXPECT_EQ(card->fetch(buffer, 2 * kPageBytes, kProbe), filled(kProbe, 0x11));
+	card->drain();
 }
 
-TEST_F(CardViewOnWarp, APageHasOneTileForAllTheSlotsThatShowIt) {
+TEST_P(CardViewOnCard, APageHasOneTileForAllTheSlotsThatShowIt) {
 	ASSERT_EQ(engine->addSpan(kBase, kSlots * kPageBytes, SpanHome::Shared), Status::Ok);
 	home.ram[page(1)] = pattern(1);
 	home.ram[page(2)] = pattern(2);
@@ -233,20 +279,24 @@ TEST_F(CardViewOnWarp, APageHasOneTileForAllTheSlotsThatShowIt) {
 	EXPECT_EQ(engine->totals().tiles, 2u);
 	EXPECT_TRUE(home.tiles[page(1)]);
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
-	EXPECT_EQ(warp.fetch(view.resource, 0, kPageBytes), pattern(1));
-	EXPECT_EQ(warp.fetch(view.resource, 5 * kPageBytes, kPageBytes), pattern(1));
-	EXPECT_EQ(warp.fetch(view.resource, kPageBytes, kPageBytes), pattern(2));
-	EXPECT_EQ(warp.fetch(view.resource, 2 * kPageBytes, kProbe), filled(kProbe, 0));
+	EXPECT_EQ(card->fetch(view, 0, kPageBytes), pattern(1));
+	EXPECT_EQ(card->fetch(view, 5 * kPageBytes, kPageBytes), pattern(1));
+	EXPECT_EQ(card->fetch(view, kPageBytes, kPageBytes), pattern(2));
+	if (zeros()) {
+		EXPECT_EQ(card->fetch(view, 2 * kPageBytes, kProbe), filled(kProbe, 0));
+	}
 	engine->slotChanged(slot(0), deunify::kNoPage);
 	EXPECT_EQ(engine->totals().tiles, 2u);
 	engine->slotChanged(slot(5), deunify::kNoPage);
 	EXPECT_EQ(engine->totals().tiles, 1u);
 	EXPECT_FALSE(home.tiles[page(1)]);
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
-	EXPECT_EQ(warp.fetch(view.resource, 0, kProbe), filled(kProbe, 0));
+	if (zeros()) {
+		EXPECT_EQ(card->fetch(view, 0, kProbe), filled(kProbe, 0));
+	}
 }
 
-TEST_F(CardViewOnWarp, AViewAsksForTheSlotsOfItsOwnRangeOnly) {
+TEST_P(CardViewOnCard, AViewAsksForTheSlotsOfItsOwnRangeOnly) {
 	ASSERT_EQ(engine->addSpan(kBase, kSlots * kPageBytes, SpanHome::Shared), Status::Ok);
 	for (uint64_t i = 0; i < 5; ++i) {
 		engine->slotChanged(slot(i), page(i + 1));
@@ -272,7 +322,7 @@ TEST_F(CardViewOnWarp, AViewAsksForTheSlotsOfItsOwnRangeOnly) {
 	EXPECT_EQ(engine->addSpan(wide, kPageBytes, SpanHome::Shared), Status::InvalidArgument);
 }
 
-TEST_F(CardViewOnWarp, TilesComeFromTheLowestHeapAndEmptyHeapsPastTheSpareGo) {
+TEST_P(CardViewOnCard, TilesComeFromTheLowestHeapAndEmptyHeapsPastTheSpareGo) {
 	ASSERT_EQ(engine->addSpan(kBase, deunify::kLargestAskBytes, SpanHome::Shared), Status::Ok);
 	const uint64_t pages = 2 * kHeapSize + 1;
 	for (uint64_t i = 0; i < pages; ++i) {
@@ -281,7 +331,7 @@ TEST_F(CardViewOnWarp, TilesComeFromTheLowestHeapAndEmptyHeapsPastTheSpareGo) {
 	BufferView view;
 	ASSERT_EQ(engine->bufferFor(kBase, pages * kPageBytes, &view), Status::Ok);
 	EXPECT_EQ(engine->totals().heaps, 3u);
-	EXPECT_EQ(home.heaps, 3);
+	EXPECT_EQ(cardHeaps(), 3u);
 	EXPECT_EQ(engine->tileAt(slot(0)), (Tile {0, 0}));
 	EXPECT_EQ(engine->tileAt(slot(kHeapSize - 1)), (Tile {0, uint32_t(kHeapSize - 1)}));
 	EXPECT_EQ(engine->tileAt(slot(kHeapSize)), (Tile {1, 0}));
@@ -301,16 +351,17 @@ TEST_F(CardViewOnWarp, TilesComeFromTheLowestHeapAndEmptyHeapsPastTheSpareGo) {
 	EXPECT_EQ(engine->retiredHeaps(), 1u);
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
 	EXPECT_EQ(engine->retiredHeaps(), 1u);
-	warp.drain();
+	card->drain();
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
 	EXPECT_EQ(engine->retiredHeaps(), 0u);
 	engine->slotChanged(slot(later + 1), page(later + 2));
 	ASSERT_EQ(engine->bufferFor(slot(later + 1), kPageBytes, &view), Status::Ok);
 	EXPECT_EQ(engine->tileAt(slot(later + 1)), (Tile {1, 0}));
-	EXPECT_EQ(home.heaps, 3);
+	EXPECT_EQ(engine->totals().heaps, 2u);
+	EXPECT_EQ(cardHeaps(), 2u) << "the spare heap took the tile, no heap was made";
 }
 
-TEST_F(CardViewOnWarp, ACardPageKeepsItsTileWithoutSlotsUntilItsBytesAreReadBack) {
+TEST_P(CardViewOnCard, ACardPageKeepsItsTileWithoutSlotsUntilItsBytesAreReadBack) {
 	ASSERT_EQ(engine->addSpan(kBase, kSlots * kPageBytes, SpanHome::Card), Status::Ok);
 	const PageNumber p = page(1);
 	home.ram[p]        = pattern(3);
@@ -322,7 +373,7 @@ TEST_F(CardViewOnWarp, ACardPageKeepsItsTileWithoutSlotsUntilItsBytesAreReadBack
 	EXPECT_TRUE(engine->isCardHome(p));
 	EXPECT_TRUE(home.card.contains(p));
 	EXPECT_EQ(readBack(p), pattern(3));
-	warp.store(view.resource, 2 * kPageBytes, filled(kProbe, 0xAB));
+	card->store(view, 2 * kPageBytes, filled(kProbe, 0xAB));
 	std::vector<uint8_t> written = pattern(3);
 	std::fill_n(written.begin(), kProbe, uint8_t {0xAB});
 	EXPECT_EQ(readBack(p), written);
@@ -332,7 +383,7 @@ TEST_F(CardViewOnWarp, ACardPageKeepsItsTileWithoutSlotsUntilItsBytesAreReadBack
 	engine->slotChanged(slot(3), p);
 	EXPECT_EQ(engine->tileAt(slot(3)), tile);
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
-	EXPECT_EQ(warp.fetch(view.resource, 3 * kPageBytes, kPageBytes), written);
+	EXPECT_EQ(card->fetch(view, 3 * kPageBytes, kPageBytes), written);
 	engine->slotChanged(slot(3), deunify::kNoPage);
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
 	EXPECT_EQ(home.cameHome, std::vector<PageNumber> {p});
@@ -341,7 +392,7 @@ TEST_F(CardViewOnWarp, ACardPageKeepsItsTileWithoutSlotsUntilItsBytesAreReadBack
 	EXPECT_EQ(engine->totals().tiles, 0u);
 }
 
-TEST_F(CardViewOnWarp, ALoadIntoAPageShadersWroteGoesToItsTile) {
+TEST_P(CardViewOnCard, ALoadIntoAPageShadersWroteGoesToItsTile) {
 	ASSERT_EQ(engine->addSpan(kBase, kSlots * kPageBytes, SpanHome::Shared), Status::Ok);
 	const PageNumber p = page(1);
 	home.ram[p]        = pattern(4);
@@ -363,38 +414,36 @@ TEST_F(CardViewOnWarp, ALoadIntoAPageShadersWroteGoesToItsTile) {
 	std::copy(load.begin(), load.end(), expected.begin() + within);
 	EXPECT_EQ(readBack(p), expected);
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
-	EXPECT_EQ(warp.fetch(view.resource, 0, kPageBytes), expected);
+	EXPECT_EQ(card->fetch(view, 0, kPageBytes), expected);
 	EXPECT_EQ(readBack(p), expected);
 	EXPECT_FALSE(engine->loaded(page(9), 0, load.data(), load.size()));
 }
 
-TEST_F(CardViewOnWarp, PagesTheCpuWroteAreSentToTheirTiles) {
+TEST_P(CardViewOnCard, PagesTheCpuWroteAreSentToTheirTiles) {
 	ASSERT_EQ(engine->addSpan(kBase, kSlots * kPageBytes, SpanHome::Shared), Status::Ok);
 	const PageNumber p = page(1);
 	engine->slotChanged(slot(7), p);
 	BufferView view;
 	ASSERT_EQ(engine->bufferFor(slot(7), kPageBytes, &view), Status::Ok);
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
-	EXPECT_EQ(warp.fetch(view.resource, 7 * kPageBytes, kPageBytes), filled(kPageBytes, 0));
+	EXPECT_EQ(card->fetch(view, 7 * kPageBytes, kPageBytes), filled(kPageBytes, 0));
 	home.ram[p] = pattern(9);
 	home.written.push_back(p);
 	home.written.push_back(page(2));
 	ASSERT_EQ(engine->beforeSubmit(), Status::Ok);
-	EXPECT_EQ(warp.fetch(view.resource, 7 * kPageBytes, kPageBytes), pattern(9));
+	EXPECT_EQ(card->fetch(view, 7 * kPageBytes, kPageBytes), pattern(9));
 	EXPECT_EQ(engine->totals().fillBytes, 2 * kPageBytes);
 }
 
-class Library: public ::testing::Test {
+class Library: public ::testing::TestWithParam<Api> {
 protected:
 	void SetUp() override {
-		if (!warp.tiled()) {
-			GTEST_SKIP() << "WARP without tiled resources tier 2";
+		card = deunify::test::makeTestCard(GetParam());
+		if (const std::string missing = card->missing(); !missing.empty()) {
+			GTEST_SKIP() << missing;
 		}
-		deunify::Config config;
-		config.device = warp.device.Get();
-		config.queue  = warp.queue.Get();
 		Status status = Status::Ok;
-		context       = deunify::Context::create(config, deunify::Callbacks {}, &status);
+		context       = deunify::Context::create(card->config(), deunify::Callbacks {}, &status);
 		ASSERT_EQ(status, Status::Ok);
 		ASSERT_EQ(context->physical().allocate(1, 0, &p), Status::Ok);
 		ASSERT_EQ(context->gpuPages().addGpuRange(kBase, kSlots * kPageBytes), Status::Ok);
@@ -407,14 +456,17 @@ protected:
 		ASSERT_EQ(context->cardView()->beforeSubmit(), Status::Ok);
 	}
 
-	Warp                              warp;
+	std::unique_ptr<TestCard>         card;
 	std::unique_ptr<deunify::Context> context;
 	PageNumber                        p {};
 	BufferView                        view;
 };
 
-TEST_F(Library, ACardPageReadByTheEmulatorShowsWhatTheCardWrote) {
-	warp.store(view.resource, view.offset, filled(kProbe, 0x3C));
+INSTANTIATE_TEST_SUITE_P(Backends, Library, ::testing::ValuesIn(deunify::test::kApis),
+                         deunify::test::apiName);
+
+TEST_P(Library, ACardPageReadByTheEmulatorShowsWhatTheCardWrote) {
+	card->store(view, view.offset, filled(kProbe, 0x3C));
 	std::vector<uint8_t> bytes(kProbe);
 	ASSERT_EQ(context->gpuPages().read(kBase, bytes.data(), kProbe, deunify::ReadPurpose::Inspect),
 	          Status::Ok);
@@ -422,12 +474,12 @@ TEST_F(Library, ACardPageReadByTheEmulatorShowsWhatTheCardWrote) {
 	EXPECT_EQ(context->cardView()->totals().cardHomePages, 1u);
 }
 
-TEST_F(Library, AWriteIntoAPageShadersWroteGoesToItsTile) {
+TEST_P(Library, AWriteIntoAPageShadersWroteGoesToItsTile) {
 	const std::vector<uint8_t> load    = filled(32, 0x77);
 	const PageNumber           pages[] = {p};
 	ASSERT_EQ(context->loads().write(pages, 0x40, load.data(), load.size()), Status::Ok);
 	ASSERT_EQ(context->cardView()->beforeSubmit(), Status::Ok);
-	EXPECT_EQ(warp.fetch(view.resource, view.offset + 0x40, load.size()), load);
+	EXPECT_EQ(card->fetch(view, view.offset + 0x40, load.size()), load);
 }
 
 } // namespace

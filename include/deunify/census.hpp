@@ -16,6 +16,14 @@ struct ID3D12Resource;
 struct ID3D12Device;
 struct IDXGIAdapter3;
 
+namespace deunify::detail {
+class Ledger;
+}
+
+namespace deunify::gpu {
+class Backend;
+}
+
 namespace deunify {
 
 class Context;
@@ -87,6 +95,9 @@ private:
 	friend class CardView;
 
 	explicit Census(Context& context);
+
+	std::shared_ptr<detail::Ledger> ledger() const;
+	void                            attach(gpu::Backend* backend);
 
 	struct Impl;
 	Context&              m_context;
