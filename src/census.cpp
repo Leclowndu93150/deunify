@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <unordered_map>
 
 namespace deunify {
 
@@ -41,7 +42,8 @@ std::string systemText(const SystemMemory& system) {
 	if (!system.known) {
 		return "system: not known";
 	}
-	return "system: card " + megabytes(system.localUsage) + " of " + megabytes(system.localBudget) +
+	return std::string(system.counted ? "system (heap sizes, our counts)" : "system") + ": card " +
+	       megabytes(system.localUsage) + " of " + megabytes(system.localBudget) +
 	       " budget, shared " + megabytes(system.nonLocalUsage) + " of " + megabytes(system.nonLocalBudget) +
 	       " budget";
 }
@@ -95,7 +97,24 @@ struct Census::Impl {
 		return backend != nullptr ? backend->systemMemory(ledger->uses()) : SystemMemory {};
 	}
 
+	struct Tracked {
+		Category category;
+		bool     card;
+		uint64_t bytes;
+	};
+
+	void untrack(VkDeviceMemory memory) {
+		std::lock_guard lock(trackedMutex);
+		auto            held = tracked.find(memory);
+		if (held != tracked.end()) {
+			ledger->uncount(held->second.category, held->second.card, held->second.bytes);
+			tracked.erase(held);
+		}
+	}
+
 	std::shared_ptr<detail::Ledger>    ledger = std::make_shared<detail::Ledger>();
+	std::mutex                         trackedMutex;
+	std::unordered_map<VkDeviceMemory, Tracked> tracked;
 	std::mutex                         reportMutex;
 	std::shared_ptr<gpu::MemoryReport> adapterReport;
 	gpu::Backend*                      backend = nullptr;
@@ -117,6 +136,26 @@ Status Census::track(ID3D12Heap* heap, Category category) {
 
 Status Census::track(ID3D12Device* device, ID3D12Resource* resource, Category category) {
 	return detail::trackResource(m_impl->ledger, device, resource, category);
+}
+
+Status Census::track(VkDeviceMemory memory, uint64_t bytes, uint32_t memoryType, Category category) {
+	if (memory == VK_NULL_HANDLE || !m_impl->ledger->known(category)) {
+		return Status::InvalidArgument;
+	}
+	const std::optional<bool> card =
+	    m_impl->backend != nullptr ? m_impl->backend->memoryTypeOnCard(memoryType) : std::nullopt;
+	if (!card) {
+		return Status::Unavailable;
+	}
+	m_impl->untrack(memory);
+	std::lock_guard lock(m_impl->trackedMutex);
+	m_impl->ledger->count(category, *card, bytes);
+	m_impl->tracked[memory] = Impl::Tracked {category, *card, bytes};
+	return Status::Ok;
+}
+
+void Census::untrack(VkDeviceMemory memory) {
+	m_impl->untrack(memory);
 }
 
 CensusSnapshot Census::snapshot() {

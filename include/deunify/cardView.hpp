@@ -2,6 +2,8 @@
 
 #include "deunify/types.hpp"
 
+#include <vulkan/vulkan_core.h>
+
 #include <memory>
 #include <span>
 #include <vector>
@@ -12,11 +14,23 @@ namespace deunify {
 
 class Context;
 
-// Where in the card view's buffers a GPU range sits. `resource` is not AddRef'd for you.
+// Where in the card view's buffers a GPU range sits: `bytes` from `offset` of one buffer on.
+// On D3D12 the buffer is `resource`, not AddRef'd for you. On Vulkan it is `buffer`, and
+// `deviceAddress` is the device address of `offset` in it.
 struct BufferView {
-	ID3D12Resource* resource = nullptr;
-	uint64_t        offset   = 0;
-	uint64_t        bytes    = 0;
+	ID3D12Resource* resource      = nullptr;
+	VkBuffer        buffer        = VK_NULL_HANDLE;
+	uint64_t        deviceAddress = 0;
+	uint64_t        offset        = 0;
+	uint64_t        bytes         = 0;
+};
+
+// A span as one flat range of device addresses (Vulkan): GPU address `gpuBase + n` is device
+// address `deviceAddress + n`.
+struct SpanAddress {
+	uint64_t gpuBase       = 0;
+	uint64_t bytes         = 0;
+	uint64_t deviceAddress = 0;
 };
 
 enum class SpanHome : uint8_t {
@@ -29,7 +43,8 @@ enum class SpanHome : uint8_t {
 
 // A D3D12 buffer view must start in the first 4 GiB of its buffer and hold at most 2^27
 // elements. Segments of 4 GiB starting every 2 GiB mean any view under 2 GiB starts in the
-// first half of some segment.
+// first half of some segment. On Vulkan a segment is as long as maxStorageBufferRange allows,
+// at most 4 GiB, and they start every half segment.
 inline constexpr uint64_t kSegmentStep     = 2ull << 30;
 inline constexpr uint64_t kSegmentBytes    = 4ull << 30;
 inline constexpr uint32_t kHeapTiles       = 1024; // 64 MiB heaps
@@ -45,9 +60,10 @@ inline constexpr uint32_t kSpareEmptyHeaps = 1;
 // drain; an empty heap is released once the queue is done with it, keeping kSpareEmptyHeaps.
 //
 // Nothing reaches the card until beforeSubmit. Tile mapping changes, home changes and fills
-// are batched and go on Config::queue ahead of the title's lists. The one exception is a
-// read-back, which any thread may put on the queue under the queue order lock; it then waits
-// for the copy with no lock held.
+// are batched and go on Config::queue ahead of the title's lists (on Vulkan: bindings on the
+// sparse queue, copies on the transfer queue after them). The one exception is a read-back,
+// which any thread may put on the queue under the queue order lock; it then waits for the
+// copy with no lock held.
 class CardView {
 public:
 	CardView(const CardView&)            = delete;
@@ -66,6 +82,16 @@ public:
 	// path. OutOfMemory if no tile heap can be made. Slots the page table leaves unmapped read
 	// as zero. The tiles are ready for lists submitted after the next beforeSubmit.
 	Status bufferFor(uint64_t gpuAddress, uint64_t bytes, BufferView* view);
+
+	// The span holding `gpuAddress` as one flat range of device addresses, so a translated
+	// shader can turn a console pointer into a base and an offset. Vulkan only (NotSupported on
+	// D3D12); NotFound outside every span. The addresses are backed where bufferFor gave tiles,
+	// just like the views: ask for what a shader reads before you hand it the pointer.
+	Status spanAddress(uint64_t gpuAddress, SpanAddress* address);
+
+	// Whether a shader that reads a slot nobody mapped gets zeros. Always on D3D12; on Vulkan
+	// only with residencyNonResidentStrict, and otherwise such reads are undefined.
+	bool unboundReadsZero() const;
 
 	// Shaders in later lists may write this range: every UAV and copy destination over title
 	// memory, and every writable view a shader could pick from a heap at run time. Declaring

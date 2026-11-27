@@ -38,10 +38,26 @@ void report(Status* status, Status value) {
 	}
 }
 
+bool wantsVulkan(const Config& config) {
+	return config.vulkan.device != VK_NULL_HANDLE;
+}
+
+bool completeVulkan(const VulkanSetup& vulkan) {
+	return vulkan.instance != VK_NULL_HANDLE && vulkan.physicalDevice != VK_NULL_HANDLE &&
+	       vulkan.getInstanceProcAddr != nullptr && vulkan.sparseQueue != VK_NULL_HANDLE &&
+	       vulkan.transferQueue != VK_NULL_HANDLE;
+}
+
 Status checked(const Config& config) {
 	const bool device = config.device != nullptr;
 	const bool queue  = config.queue != nullptr;
-	return device == queue ? Status::Ok : Status::InvalidArgument;
+	if (device != queue) {
+		return Status::InvalidArgument;
+	}
+	if (wantsVulkan(config) && (device || !completeVulkan(config.vulkan))) {
+		return Status::InvalidArgument;
+	}
+	return Status::Ok;
 }
 
 std::vector<Range> merged(const std::vector<Change>& changes, ChangeReason reason) {
@@ -88,6 +104,10 @@ std::unique_ptr<Context> Context::create(const Config& config, const Callbacks& 
 		report(status, valid);
 		return nullptr;
 	}
+	if (wantsVulkan(config)) {
+		report(status, Status::NotSupported);
+		return nullptr;
+	}
 	std::unique_ptr<Context> context(new Context(config, callbacks));
 	if (CardView* cardView = context->cardView()) {
 		const Status started = cardView->start();
@@ -111,7 +131,7 @@ Context::Context(const Config& config, const Callbacks& callbacks)
 	m_impl->pages.reset(new Pages(*this));
 	m_impl->gpuPages.reset(new GpuPageTable(*this));
 	m_impl->census.reset(new Census(*this));
-	if (config.device != nullptr) {
+	if (config.device != nullptr || wantsVulkan(config)) {
 		m_impl->cardView.reset(new CardView(*this));
 	}
 }

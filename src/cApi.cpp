@@ -77,6 +77,11 @@ bool texturesOverThrough(void* context, uint64_t gpuAddress, uint64_t bytes) {
 	return c.texturesOver(c.context, gpuAddress, bytes) != 0;
 }
 
+void queueLockThrough(void* context, VkQueue queue, bool lock) {
+	const DeunifyCallbacks& c = callbacksOf(context);
+	c.queueLock(c.context, queue, lock ? 1 : 0);
+}
+
 Callbacks callbacksFor(DeunifyContext* holder) {
 	const DeunifyCallbacks& c = holder->callbacks;
 	Callbacks               callbacks;
@@ -86,6 +91,7 @@ Callbacks callbacksFor(DeunifyContext* holder) {
 	callbacks.pagesChanged = c.pagesChanged != nullptr ? pagesChangedThrough : nullptr;
 	callbacks.regionOf     = c.regionOf != nullptr ? regionOfThrough : nullptr;
 	callbacks.texturesOver = c.texturesOver != nullptr ? texturesOverThrough : nullptr;
+	callbacks.queueLock    = c.queueLock != nullptr ? queueLockThrough : nullptr;
 	return callbacks;
 }
 
@@ -97,6 +103,16 @@ Config configOf(const DeunifyConfig& c) {
 	config.decodeWorkers     = c.decodeWorkers;
 	config.device            = static_cast<ID3D12Device*>(c.device);
 	config.queue             = static_cast<ID3D12CommandQueue*>(c.queue);
+	const DeunifyVulkanSetup& v = c.vulkan;
+	config.vulkan.instance            = static_cast<VkInstance>(v.instance);
+	config.vulkan.physicalDevice      = static_cast<VkPhysicalDevice>(v.physicalDevice);
+	config.vulkan.device              = static_cast<VkDevice>(v.device);
+	config.vulkan.getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(v.getInstanceProcAddr);
+	config.vulkan.sparseQueue         = static_cast<VkQueue>(v.sparseQueue);
+	config.vulkan.sparseFamily        = v.sparseFamily;
+	config.vulkan.transferQueue       = static_cast<VkQueue>(v.transferQueue);
+	config.vulkan.transferFamily      = v.transferFamily;
+	config.vulkan.timelineSemaphores  = v.timelineSemaphores != 0;
 	return config;
 }
 
@@ -519,8 +535,36 @@ DeunifyStatus deunify_card_buffer_for(DeunifyContext* context, uint64_t gpuAddre
 	}
 	BufferView found;
 	Status     status = cardView->bufferFor(gpuAddress, bytes, &found);
-	*view             = DeunifyBufferView {found.resource, found.offset, found.bytes};
+	*view             = DeunifyBufferView {found.resource, found.offset, found.bytes,
+	                                       reinterpret_cast<uint64_t>(found.buffer), found.deviceAddress};
 	return toC(status);
+}
+
+DeunifyStatus deunify_card_span_address(DeunifyContext* context, uint64_t gpuAddress,
+                                        DeunifySpanAddress* address) {
+	if (context == nullptr || address == nullptr) {
+		return DEUNIFY_INVALID_ARGUMENT;
+	}
+	CardView* cardView = context->context->cardView();
+	if (cardView == nullptr) {
+		return DEUNIFY_UNAVAILABLE;
+	}
+	SpanAddress found;
+	Status      status = cardView->spanAddress(gpuAddress, &found);
+	*address           = DeunifySpanAddress {found.gpuBase, found.bytes, found.deviceAddress};
+	return toC(status);
+}
+
+DeunifyStatus deunify_card_unbound_reads_zero(DeunifyContext* context, int32_t* zero) {
+	if (context == nullptr || zero == nullptr) {
+		return DEUNIFY_INVALID_ARGUMENT;
+	}
+	CardView* cardView = context->context->cardView();
+	if (cardView == nullptr) {
+		return DEUNIFY_UNAVAILABLE;
+	}
+	*zero = cardView->unboundReadsZero() ? 1 : 0;
+	return DEUNIFY_OK;
 }
 
 DeunifyStatus deunify_card_shader_writes(DeunifyContext* context, uint64_t gpuAddress, uint64_t bytes) {
@@ -567,6 +611,21 @@ DeunifyStatus deunify_census_track_resource(DeunifyContext* context, void* devic
 	}
 	return toC(context->context->census().track(static_cast<ID3D12Device*>(device),
 	                                            static_cast<ID3D12Resource*>(resource), Category {category}));
+}
+
+DeunifyStatus deunify_census_track_memory(DeunifyContext* context, uint64_t memory, uint64_t bytes,
+                                          uint32_t memoryType, uint32_t category) {
+	if (context == nullptr) {
+		return DEUNIFY_INVALID_ARGUMENT;
+	}
+	return toC(context->context->census().track(reinterpret_cast<VkDeviceMemory>(memory), bytes,
+	                                            memoryType, Category {category}));
+}
+
+void deunify_census_untrack_memory(DeunifyContext* context, uint64_t memory) {
+	if (context != nullptr) {
+		context->context->census().untrack(reinterpret_cast<VkDeviceMemory>(memory));
+	}
 }
 
 void deunify_census_set_adapter(DeunifyContext* context, void* adapter) {

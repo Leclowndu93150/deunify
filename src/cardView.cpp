@@ -754,6 +754,26 @@ struct Engine::Impl {
 		return Status::Ok;
 	}
 
+	Status spanAddress(uint64_t gpuAddress, SpanAddress* address) {
+		if (address == nullptr) {
+			return Status::InvalidArgument;
+		}
+		Span* span = spanHolding(gpuAddress);
+		if (span == nullptr) {
+			return Status::NotFound;
+		}
+		if (!backend.flatSpans()) {
+			return Status::NotSupported;
+		}
+		const Status status = makeSegments(*span);
+		if (status != Status::Ok) {
+			return status;
+		}
+		const gpu::Region& flat = span->flat ? *span->flat : *span->regions.front();
+		*address = SpanAddress {span->start, span->bytes, flat.view(0, span->bytes).deviceAddress};
+		return Status::Ok;
+	}
+
 	void shaderWrites(uint64_t gpuAddress, uint64_t bytes) {
 		const uint32_t  count = spanCount.load(std::memory_order_acquire);
 		std::lock_guard lock(stateLock);
@@ -1289,6 +1309,14 @@ Status Engine::bufferFor(uint64_t gpuAddress, uint64_t bytes, BufferView* view) 
 	return m_impl->bufferFor(gpuAddress, bytes, view);
 }
 
+Status Engine::spanAddress(uint64_t gpuAddress, SpanAddress* address) {
+	return m_impl->spanAddress(gpuAddress, address);
+}
+
+bool Engine::unboundReadsZero() const {
+	return m_impl->backend.unboundReadsZero();
+}
+
 void Engine::shaderWrites(uint64_t gpuAddress, uint64_t bytes) {
 	m_impl->shaderWrites(gpuAddress, bytes);
 }
@@ -1410,6 +1438,14 @@ Status CardView::addSpan(uint64_t gpuBase, uint64_t bytes, SpanHome home) {
 
 Status CardView::bufferFor(uint64_t gpuAddress, uint64_t bytes, BufferView* view) {
 	return m_impl->engine.bufferFor(gpuAddress, bytes, view);
+}
+
+Status CardView::spanAddress(uint64_t gpuAddress, SpanAddress* address) {
+	return m_impl->engine.spanAddress(gpuAddress, address);
+}
+
+bool CardView::unboundReadsZero() const {
+	return m_impl->engine.unboundReadsZero();
 }
 
 void CardView::shaderWrites(uint64_t gpuAddress, uint64_t bytes) {

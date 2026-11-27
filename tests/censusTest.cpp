@@ -113,7 +113,7 @@ TEST(Census, TheLineSumsTheCardAndSaysWhatIsHeldTwice) {
 	    CategoryUse {"card view", 640 * kMegabyte, 10, 0, 0},
 	    CategoryUse {"textures", 2048 * kMegabyte, 32, 256 * kMegabyte, 4},
 	};
-	snapshot.system              = SystemMemory {true, 3000 * kMegabyte, 4000 * kMegabyte, 300 * kMegabyte, 6000 * kMegabyte};
+	snapshot.system              = SystemMemory {true, false, 3000 * kMegabyte, 4000 * kMegabyte, 300 * kMegabyte, 6000 * kMegabyte};
 	snapshot.homes.ram           = 10;
 	snapshot.homes.ramTiled      = 3;
 	snapshot.ramAndTileBytes     = 3 * kPageBytes;

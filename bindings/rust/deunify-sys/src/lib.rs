@@ -5,7 +5,7 @@
 
 use std::ffi::{c_char, c_void};
 
-pub const DEUNIFY_ABI_VERSION: u32 = 1;
+pub const DEUNIFY_ABI_VERSION: u32 = 2;
 pub const DEUNIFY_PAGE_BYTES: u64 = 0x10000;
 pub const DEUNIFY_FRAMES_PER_PAGE: u64 = 16;
 pub const DEUNIFY_PAGE_NUMBER_LIMIT: u64 = 0x200_0000;
@@ -86,6 +86,8 @@ pub type DeunifyDecodeFn = Option<unsafe extern "C" fn(context: *mut c_void, cod
 pub type DeunifyPagesChangedFn = Option<unsafe extern "C" fn(context: *mut c_void, ranges: *const DeunifyRange, count: usize, reason: u32)>;
 pub type DeunifyRegionOfFn = Option<unsafe extern "C" fn(context: *mut c_void, gpuAddress: u64, region: *mut DeunifyRange) -> i32>;
 pub type DeunifyTexturesOverFn = Option<unsafe extern "C" fn(context: *mut c_void, gpuAddress: u64, bytes: u64) -> i32>;
+/// `queue` is a VkQueue; `lock` is 1 to take the lock and 0 to drop it.
+pub type DeunifyQueueLockFn = Option<unsafe extern "C" fn(context: *mut c_void, queue: *mut c_void, lock: i32)>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -105,6 +107,24 @@ pub struct DeunifyCallbacks {
     pub pagesChanged: DeunifyPagesChangedFn,
     pub regionOf: DeunifyRegionOfFn,
     pub texturesOver: DeunifyTexturesOverFn,
+    pub queueLock: DeunifyQueueLockFn,
+}
+
+/// VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr and VkQueue handles; all
+/// null for no Vulkan card view.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DeunifyVulkanSetup {
+    pub instance: *mut c_void,
+    pub physicalDevice: *mut c_void,
+    pub device: *mut c_void,
+    pub getInstanceProcAddr: *mut c_void,
+    pub sparseQueue: *mut c_void,
+    pub transferQueue: *mut c_void,
+    pub sparseFamily: u32,
+    pub transferFamily: u32,
+    pub timelineSemaphores: u32,
+    pub reserved: u32,
 }
 
 #[repr(C)]
@@ -118,6 +138,7 @@ pub struct DeunifyConfig {
     pub reserved: u32,
     pub device: *mut c_void,
     pub queue: *mut c_void,
+    pub vulkan: DeunifyVulkanSetup,
 }
 
 #[repr(C)]
@@ -203,10 +224,22 @@ pub struct DeunifyLoadTotals {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct DeunifyBufferView {
-    /// ID3D12Resource*, not referenced for the caller.
+    /// D3D12: ID3D12Resource*, not referenced for the caller.
     pub resource: *mut c_void,
     pub offset: u64,
     pub bytes: u64,
+    /// Vulkan: VkBuffer.
+    pub buffer: u64,
+    /// Vulkan: device address of `offset` in `buffer`.
+    pub deviceAddress: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DeunifySpanAddress {
+    pub gpuBase: u64,
+    pub bytes: u64,
+    pub deviceAddress: u64,
 }
 
 #[repr(C)]
@@ -267,11 +300,15 @@ unsafe extern "C" {
     pub fn deunify_loads_totals(context: *mut DeunifyContext, totals: *mut DeunifyLoadTotals);
     pub fn deunify_card_add_span(context: *mut DeunifyContext, gpuBase: u64, bytes: u64, home: u32) -> DeunifyStatus;
     pub fn deunify_card_buffer_for(context: *mut DeunifyContext, gpuAddress: u64, bytes: u64, view: *mut DeunifyBufferView) -> DeunifyStatus;
+    pub fn deunify_card_span_address(context: *mut DeunifyContext, gpuAddress: u64, address: *mut DeunifySpanAddress) -> DeunifyStatus;
+    pub fn deunify_card_unbound_reads_zero(context: *mut DeunifyContext, zero: *mut i32) -> DeunifyStatus;
     pub fn deunify_card_shader_writes(context: *mut DeunifyContext, gpuAddress: u64, bytes: u64) -> DeunifyStatus;
     pub fn deunify_card_before_submit(context: *mut DeunifyContext) -> DeunifyStatus;
     pub fn deunify_census_add_category(context: *mut DeunifyContext, name: *const c_char) -> u32;
     pub fn deunify_census_track_heap(context: *mut DeunifyContext, heap: *mut c_void, category: u32) -> DeunifyStatus;
     pub fn deunify_census_track_resource(context: *mut DeunifyContext, device: *mut c_void, resource: *mut c_void, category: u32) -> DeunifyStatus;
+    pub fn deunify_census_track_memory(context: *mut DeunifyContext, memory: u64, bytes: u64, memoryType: u32, category: u32) -> DeunifyStatus;
+    pub fn deunify_census_untrack_memory(context: *mut DeunifyContext, memory: u64);
     pub fn deunify_census_set_adapter(context: *mut DeunifyContext, adapter: *mut c_void);
     pub fn deunify_census_totals(context: *mut DeunifyContext, totals: *mut DeunifyCensusTotals) -> DeunifyStatus;
     pub fn deunify_census_text(context: *mut DeunifyContext, text: *mut c_char, capacity: usize, length: *mut usize) -> DeunifyStatus;

@@ -2,6 +2,8 @@
 
 #include "deunify/types.hpp"
 
+#include <vulkan/vulkan_core.h>
+
 #include <cstdint>
 #include <memory>
 
@@ -49,6 +51,13 @@ using RegionOfFn = bool (*)(void* context, uint64_t gpuAddress, Range* region);
 // Census only: does a host texture cover any of these bytes?
 using TexturesOverFn = bool (*)(void* context, uint64_t gpuAddress, uint64_t bytes);
 
+// Vulkan only. A VkQueue may be used by one thread at a time, and the card view submits from
+// any thread (a read-back comes from whichever thread touched the page). If you submit to the
+// queues you gave us as well, take your lock for `queue` when `lock` is true and drop it when
+// it is false. We call it around each vkQueueSubmit and vkQueueBindSparse, with card view
+// locks held, so don't call back into deunify from it.
+using QueueLockFn = void (*)(void* context, VkQueue queue, bool lock);
+
 // All optional, except `decode` once a request uses a custom codec.
 struct Callbacks {
 	void*          context      = nullptr;
@@ -57,6 +66,29 @@ struct Callbacks {
 	PagesChangedFn pagesChanged = nullptr;
 	RegionOfFn     regionOf     = nullptr;
 	TexturesOverFn texturesOver = nullptr;
+	QueueLockFn    queueLock    = nullptr;
+};
+
+// A Vulkan device the emulator made, for a card view on Vulkan. The device must be Vulkan 1.2
+// or later, created with the sparseBinding, sparseResidencyBuffer and bufferDeviceAddress
+// features. deunify loads every function it needs through getInstanceProcAddr and never links
+// the loader.
+struct VulkanSetup {
+	VkInstance                instance            = VK_NULL_HANDLE;
+	VkPhysicalDevice          physicalDevice      = VK_NULL_HANDLE;
+	VkDevice                  device              = VK_NULL_HANDLE;
+	PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
+	// Where tile bindings go. Its family has VK_QUEUE_SPARSE_BINDING_BIT. It may be the
+	// transfer queue.
+	VkQueue  sparseQueue  = VK_NULL_HANDLE;
+	uint32_t sparseFamily = 0;
+	// Fills and read-backs. Like Config::queue on D3D12, this has to be the queue the title's
+	// work over card-view memory runs on: that is what orders our copies against it.
+	VkQueue  transferQueue  = VK_NULL_HANDLE;
+	uint32_t transferFamily = 0;
+	// True if the device was created with the timelineSemaphore feature. Without it we wait
+	// for each batch of bindings on the CPU before anything that needs them is submitted.
+	bool timelineSemaphores = false;
 };
 
 struct Config {
@@ -69,11 +101,15 @@ struct Config {
 	uint32_t maxRecordsPerPage = 128;
 	// 0 means half the logical processors, clamped to 2..8.
 	uint32_t decodeWorkers = 0;
-	// Both null: no card view. Card home never happens and GPU-only mappings become RAM views.
-	// Both set: the card view lives on this device and puts all its work on this queue, which
-	// has to be the queue that runs the title's work over card-view memory. Both are AddRef'd.
+	// Both null and no Vulkan device: no card view. Card home never happens and GPU-only
+	// mappings become RAM views. Both set: the card view lives on this D3D12 device and puts all
+	// its work on this queue, which has to be the queue that runs the title's work over
+	// card-view memory. Both are AddRef'd.
 	ID3D12Device*       device = nullptr;
 	ID3D12CommandQueue* queue  = nullptr;
+	// Or vulkan.device set (with the rest of it) and the two above null: the card view on Vulkan.
+	// Nothing in it is referenced or destroyed for you; keep it alive past the context.
+	VulkanSetup vulkan;
 };
 
 // One per emulated title process. Component methods are callable from any thread unless their
@@ -96,8 +132,9 @@ struct Config {
 // that way if you change it.
 class Context {
 public:
-	// Null on failure. NotSupported if a card view was asked for and the device lacks tiled
-	// resources tier 2.
+	// Null on failure. NotSupported if a card view was asked for and the device can't hold one:
+	// on D3D12 no tiled resources tier 2, on Vulkan no sparse residency for buffers, no buffer
+	// device address, or a sparse block size that doesn't divide 64 KiB.
 	static std::unique_ptr<Context> create(const Config& config, const Callbacks& callbacks,
 	                                       Status* status = nullptr);
 
@@ -109,7 +146,7 @@ public:
 	GpuPageTable&   gpuPages();
 	Pages&          pages();
 	Loads&          loads();
-	CardView*       cardView(); // null without a device
+	CardView*       cardView(); // null without a D3D12 or Vulkan device
 	Census&         census();
 
 	const Config&    config() const;

@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define DEUNIFY_ABI_VERSION 1u
+#define DEUNIFY_ABI_VERSION 2u
 
 #define DEUNIFY_PAGE_BYTES         0x10000ull
 #define DEUNIFY_FRAMES_PER_PAGE    16ull
@@ -143,6 +143,8 @@ typedef void (*DeunifyPagesChangedFn)(void* context, const DeunifyRange* ranges,
                                       uint32_t reason);
 typedef int32_t (*DeunifyRegionOfFn)(void* context, uint64_t gpuAddress, DeunifyRange* region);
 typedef int32_t (*DeunifyTexturesOverFn)(void* context, uint64_t gpuAddress, uint64_t bytes);
+/* `queue` is a VkQueue; `lock` is 1 to take the lock and 0 to drop it. */
+typedef void (*DeunifyQueueLockFn)(void* context, void* queue, int32_t lock);
 
 /* deunify::Callbacks */
 typedef struct DeunifyCallbacks {
@@ -154,18 +156,35 @@ typedef struct DeunifyCallbacks {
 	DeunifyPagesChangedFn pagesChanged;
 	DeunifyRegionOfFn     regionOf;
 	DeunifyTexturesOverFn texturesOver;
+	DeunifyQueueLockFn    queueLock;
 } DeunifyCallbacks;
+
+/* deunify::VulkanSetup. VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr and
+ * VkQueue handles; all null for no Vulkan card view. */
+typedef struct DeunifyVulkanSetup {
+	void*    instance;
+	void*    physicalDevice;
+	void*    device;
+	void*    getInstanceProcAddr;
+	void*    sparseQueue;
+	void*    transferQueue;
+	uint32_t sparseFamily;
+	uint32_t transferFamily;
+	uint32_t timelineSemaphores;
+	uint32_t reserved;
+} DeunifyVulkanSetup;
 
 /* deunify::Config; device and queue are ID3D12Device* and ID3D12CommandQueue*, or null */
 typedef struct DeunifyConfig {
-	uint32_t version;
-	uint32_t maxRecordsPerPage;
-	uint64_t stagingCapBytes;
-	uint64_t decodedCapBytes;
-	uint32_t decodeWorkers;
-	uint32_t reserved;
-	void*    device;
-	void*    queue;
+	uint32_t           version;
+	uint32_t           maxRecordsPerPage;
+	uint64_t           stagingCapBytes;
+	uint64_t           decodedCapBytes;
+	uint32_t           decodeWorkers;
+	uint32_t           reserved;
+	void*              device;
+	void*              queue;
+	DeunifyVulkanSetup vulkan;
 } DeunifyConfig;
 
 /* Fills a DeunifyConfig with the defaults of deunify::Config. */
@@ -332,15 +351,29 @@ DEUNIFY_API void          deunify_loads_totals(DeunifyContext* context, DeunifyL
 /* ---- CardView (DEUNIFY_UNAVAILABLE without a device in the config) ---- */
 
 typedef struct DeunifyBufferView {
-	void*    resource; /* ID3D12Resource*, not referenced for the caller */
+	void*    resource;      /* D3D12: ID3D12Resource*, not referenced for the caller */
 	uint64_t offset;
 	uint64_t bytes;
+	uint64_t buffer;        /* Vulkan: VkBuffer */
+	uint64_t deviceAddress; /* Vulkan: device address of `offset` in `buffer` */
 } DeunifyBufferView;
+
+typedef struct DeunifySpanAddress {
+	uint64_t gpuBase;
+	uint64_t bytes;
+	uint64_t deviceAddress;
+} DeunifySpanAddress;
 
 DEUNIFY_API DeunifyStatus deunify_card_add_span(DeunifyContext* context, uint64_t gpuBase,
                                                 uint64_t bytes, uint32_t home);
 DEUNIFY_API DeunifyStatus deunify_card_buffer_for(DeunifyContext* context, uint64_t gpuAddress,
                                                   uint64_t bytes, DeunifyBufferView* view);
+DEUNIFY_API DeunifyStatus deunify_card_span_address(DeunifyContext* context,
+                                                    uint64_t gpuAddress,
+                                                    DeunifySpanAddress* address);
+/* `*zero` is 1 if reads of unbound slots return zeros, 0 if they are undefined. */
+DEUNIFY_API DeunifyStatus deunify_card_unbound_reads_zero(DeunifyContext* context,
+                                                          int32_t* zero);
 DEUNIFY_API DeunifyStatus deunify_card_shader_writes(DeunifyContext* context,
                                                      uint64_t gpuAddress, uint64_t bytes);
 DEUNIFY_API DeunifyStatus deunify_card_before_submit(DeunifyContext* context);
@@ -369,6 +402,12 @@ DEUNIFY_API DeunifyStatus deunify_census_track_heap(DeunifyContext* context, voi
                                                     uint32_t category);
 DEUNIFY_API DeunifyStatus deunify_census_track_resource(DeunifyContext* context, void* device,
                                                         void* resource, uint32_t category);
+/* `memory` is a VkDeviceMemory. */
+DEUNIFY_API DeunifyStatus deunify_census_track_memory(DeunifyContext* context, uint64_t memory,
+                                                      uint64_t bytes, uint32_t memoryType,
+                                                      uint32_t category);
+DEUNIFY_API void          deunify_census_untrack_memory(DeunifyContext* context,
+                                                        uint64_t memory);
 /* `adapter` is an IDXGIAdapter3*. */
 DEUNIFY_API void          deunify_census_set_adapter(DeunifyContext* context, void* adapter);
 DEUNIFY_API DeunifyStatus deunify_census_totals(DeunifyContext* context,

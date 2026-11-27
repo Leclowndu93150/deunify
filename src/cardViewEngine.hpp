@@ -75,6 +75,8 @@ public:
 	Status           start();
 	Status           addSpan(uint64_t gpuBase, uint64_t bytes, SpanHome home);
 	Status           bufferFor(uint64_t gpuAddress, uint64_t bytes, BufferView* view);
+	Status           spanAddress(uint64_t gpuAddress, SpanAddress* address);
+	bool             unboundReadsZero() const;
 	void             shaderWrites(uint64_t gpuAddress, uint64_t bytes);
 	Status           beforeSubmit();
 	CardView::Totals totals() const;

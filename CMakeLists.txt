@@ -23,6 +23,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(zlib)
 
+FetchContent_Declare(
+	vulkan_headers
+	URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.309.tar.gz
+	URL_HASH SHA256=437925ada160d86ed763d29dcb9318c1bb0d024d7deaf77bc7c170b8eb6b6f10
+	DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+	EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(vulkan_headers)
+
 add_library(deunify_zlib INTERFACE)
 target_include_directories(deunify_zlib SYSTEM INTERFACE "${zlib_SOURCE_DIR}" "${zlib_BINARY_DIR}")
 target_link_libraries(deunify_zlib INTERFACE zlibstatic)
@@ -65,7 +74,8 @@ function(deunify_configure target)
 	target_include_directories(${target} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
 	                                     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 	target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
-	target_link_libraries(${target} PRIVATE deunify_zlib PUBLIC d3d12 dxgi onecore)
+	target_compile_definitions(${target} PRIVATE VK_NO_PROTOTYPES)
+	target_link_libraries(${target} PRIVATE deunify_zlib PUBLIC Vulkan::Headers d3d12 dxgi onecore)
 	if(MSVC)
 		target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
 	else()
@@ -109,7 +119,7 @@ if(DEUNIFY_BUILD_TESTS)
 		tests/patchTest.cpp
 		tests/physicalMemoryTest.cpp
 	)
-	target_compile_definitions(deunify_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+	target_compile_definitions(deunify_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN VK_NO_PROTOTYPES)
 	target_include_directories(deunify_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 	target_link_libraries(deunify_tests PRIVATE deunify_static deunify_zlib GTest::gtest_main)
 	if(MSVC)
