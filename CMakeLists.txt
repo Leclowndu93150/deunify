@@ -53,6 +53,7 @@ set(DEUNIFY_SOURCES
 	src/patch.cpp
 	src/physicalMemory.cpp
 	src/staging.cpp
+	src/vulkanBackend.cpp
 	src/workerPool.cpp
 )
 

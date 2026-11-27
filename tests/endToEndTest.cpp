@@ -1,6 +1,6 @@
 #include "deunify/deunify.hpp"
 
-#include "testCard.hpp"
+#include "cards.hpp"
 #include "testFiles.hpp"
 
 #include <windows.h>

@@ -5,7 +5,7 @@
 #include "deunify/gpuPageTable.hpp"
 #include "deunify/loads.hpp"
 #include "deunify/physicalMemory.hpp"
-#include "testCard.hpp"
+#include "cards.hpp"
 
 #include <cstring>
 #include <gtest/gtest.h>

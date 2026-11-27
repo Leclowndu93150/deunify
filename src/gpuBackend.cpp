@@ -1,6 +1,7 @@
 #include "gpuBackend.hpp"
 
 #include "d3d12Backend.hpp"
+#include "vulkanBackend.hpp"
 
 #include <map>
 
@@ -48,8 +49,11 @@ std::vector<BindGroup> bindGroups(std::span<const SlotMove> moves) {
 	return groups;
 }
 
-std::unique_ptr<Backend> makeBackend(const Config&                   config, const Callbacks&,
+std::unique_ptr<Backend> makeBackend(const Config& config, const Callbacks& callbacks,
                                      std::shared_ptr<detail::Ledger> ledger) {
+	if (config.vulkan.device != VK_NULL_HANDLE) {
+		return makeVulkanBackend(config.vulkan, callbacks, std::move(ledger));
+	}
 	return makeD3d12Backend(config.device, config.queue, std::move(ledger));
 }
 

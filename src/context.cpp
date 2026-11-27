@@ -104,10 +104,6 @@ std::unique_ptr<Context> Context::create(const Config& config, const Callbacks& 
 		report(status, valid);
 		return nullptr;
 	}
-	if (wantsVulkan(config)) {
-		report(status, Status::NotSupported);
-		return nullptr;
-	}
 	std::unique_ptr<Context> context(new Context(config, callbacks));
 	if (CardView* cardView = context->cardView()) {
 		const Status started = cardView->start();

@@ -156,7 +156,7 @@ public:
 	// this for you; without a card view, call it wherever your texture cache wants the news.
 	void deliverChanges();
 
-	// Win32 error or HRESULT behind this thread's last HostFailure, 0 if none.
+	// Win32 error, HRESULT or VkResult behind this thread's last HostFailure, 0 if none.
 	static uint32_t lastHostError();
 
 	void log(LogLevel level, const char* text) const;

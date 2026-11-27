@@ -1,4 +1,4 @@
-// A card for the tests that need one, on each backend: WARP for D3D12. Copies in and out of
+// What the card view tests need from a card, and WARP as the D3D12 one. Copies in and out of
 // the card view's buffers go on the queue the card view uses.
 
 #pragma once
@@ -13,19 +13,6 @@
 #include <vector>
 
 namespace deunify::test {
-
-enum class Api {
-	D3d12,
-};
-
-inline const Api kApis[] = {Api::D3d12};
-
-inline std::string apiName(const ::testing::TestParamInfo<Api>& info) {
-	switch (info.param) {
-		case Api::D3d12: return "D3D12";
-	}
-	return "Unknown";
-}
 
 class TestCard {
 public:
@@ -70,12 +57,5 @@ public:
 private:
 	Warp m_warp;
 };
-
-inline std::unique_ptr<TestCard> makeTestCard(Api api) {
-	switch (api) {
-		case Api::D3d12: return std::make_unique<WarpCard>();
-	}
-	return nullptr;
-}
 
 } // namespace deunify::test
